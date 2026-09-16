@@ -11,6 +11,7 @@ use App\Http\Controllers\Api\V1\RingGroupController;
 use App\Http\Controllers\Api\V1\VoicemailController;
 use App\Http\Controllers\Api\V1\PhoneNumberController;
 use App\Http\Controllers\Api\V1\CdrController;
+use App\Http\Controllers\Api\V1\GatewayController;
 
 /*
 |--------------------------------------------------------------------------
@@ -195,4 +196,28 @@ Route::middleware(['auth:sanctum', 'api.token.auth', 'throttle:api'])->group(fun
 
     Route::get('/domains/{domain_uuid}/cdrs/{xml_cdr_uuid}/recording-url', [CdrController::class, 'recordingUrl'])
         ->middleware('user.authorize:xml_cdr_view');
+
+    // --- CallPulse additions ---
+
+    /*
+    |--------------------------------------------------------------------------
+    | Gateways (domain-scoped)
+    |--------------------------------------------------------------------------
+    */
+    Route::post('/domains/{domain_uuid}/gateways', [GatewayController::class, 'store'])
+        ->middleware('user.authorize:gateway_add');
+
+    Route::get('/domains/{domain_uuid}/gateways/{gateway_uuid}', [GatewayController::class, 'show'])
+        ->middleware('user.authorize:gateway_view');
+
+    Route::patch('/domains/{domain_uuid}/gateways/{gateway_uuid}', [GatewayController::class, 'update'])
+        ->middleware('user.authorize:gateway_edit');
+
+    Route::delete('/domains/{domain_uuid}/gateways/{gateway_uuid}', [GatewayController::class, 'destroy'])
+        ->middleware('user.authorize:gateway_delete');
+
+    Route::post('/domains/{domain_uuid}/gateways/{gateway_uuid}/restart', [GatewayController::class, 'restart'])
+        ->middleware('user.authorize:gateway_edit');
+
+    // --- fin CallPulse additions ---
 });
