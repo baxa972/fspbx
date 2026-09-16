@@ -13,6 +13,7 @@ use App\Http\Controllers\Api\V1\PhoneNumberController;
 use App\Http\Controllers\Api\V1\CdrController;
 use App\Http\Controllers\Api\V1\GatewayController;
 use App\Http\Controllers\Api\V1\AccessControlController;
+use App\Http\Controllers\Api\V1\DialplanController;
 
 /*
 |--------------------------------------------------------------------------
@@ -241,6 +242,33 @@ Route::middleware(['auth:sanctum', 'api.token.auth', 'throttle:api'])->group(fun
 
     Route::patch('/access-controls/{access_control_uuid}', [AccessControlController::class, 'update'])
         ->middleware('user.authorize:access_control_edit');
+
+    /*
+    |--------------------------------------------------------------------------
+    | Dialplans (domain-scoped)
+    |--------------------------------------------------------------------------
+    |
+    | /dialplans/reload is a literal segment declared BEFORE
+    | /dialplans/{dialplan_uuid} so it can never be read as a UUID.
+    |
+    */
+    Route::get('/domains/{domain_uuid}/dialplans', [DialplanController::class, 'index'])
+        ->middleware('user.authorize:dialplan_view');
+
+    Route::post('/domains/{domain_uuid}/dialplans', [DialplanController::class, 'store'])
+        ->middleware('user.authorize:dialplan_add');
+
+    Route::post('/domains/{domain_uuid}/dialplans/reload', [DialplanController::class, 'reload'])
+        ->middleware('user.authorize:dialplan_view');
+
+    Route::get('/domains/{domain_uuid}/dialplans/{dialplan_uuid}', [DialplanController::class, 'show'])
+        ->middleware('user.authorize:dialplan_view');
+
+    Route::patch('/domains/{domain_uuid}/dialplans/{dialplan_uuid}', [DialplanController::class, 'update'])
+        ->middleware('user.authorize:dialplan_edit');
+
+    Route::delete('/domains/{domain_uuid}/dialplans/{dialplan_uuid}', [DialplanController::class, 'destroy'])
+        ->middleware('user.authorize:dialplan_delete');
 
     // --- fin CallPulse additions ---
 });
