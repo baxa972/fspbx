@@ -2,6 +2,8 @@
 
 namespace App\Http\Controllers\Api\V1;
 
+use App\Http\Controllers\Api\V1\Concerns\LogsApiErrors;
+
 use App\Data\Api\V1\GatewayData;
 use App\Exceptions\ApiException;
 use App\Http\Controllers\Controller;
@@ -17,6 +19,8 @@ use Illuminate\Support\Facades\DB;
 
 class GatewayController extends Controller
 {
+    use LogsApiErrors;
+
     /**
      * Columns of v_gateways that GatewayService::saveData() reads as input.
      * Used to rebuild the full payload on a PATCH: saveData() turns every key it
@@ -104,7 +108,7 @@ class GatewayController extends Controller
                 ->json($payload->toArray(), 201)
                 ->header('Location', "/api/v1/domains/{$domain_uuid}/gateways/{$gateway->gateway_uuid}");
         } catch (\Throwable $e) {
-            logger('API Gateway store error: ' . $e->getMessage() . ' at ' . $e->getFile() . ':' . $e->getLine());
+            $this->logApiError('API Gateway store error', $e);
             throw new ApiException(500, 'api_error', 'Internal server error.', 'internal_error');
         }
     }
@@ -143,7 +147,7 @@ class GatewayController extends Controller
 
             return response()->json($payload->toArray(), 200);
         } catch (\Throwable $e) {
-            logger('API Gateway show error: ' . $e->getMessage() . ' at ' . $e->getFile() . ':' . $e->getLine());
+            $this->logApiError('API Gateway show error', $e);
             throw new ApiException(500, 'api_error', 'Internal server error.', 'internal_error');
         }
     }
@@ -213,7 +217,7 @@ class GatewayController extends Controller
 
             return response()->json($payload->toArray(), 200);
         } catch (\Throwable $e) {
-            logger('API Gateway update error: ' . $e->getMessage() . ' at ' . $e->getFile() . ':' . $e->getLine());
+            $this->logApiError('API Gateway update error', $e);
             throw new ApiException(500, 'api_error', 'Internal server error.', 'internal_error');
         }
     }
@@ -255,7 +259,7 @@ class GatewayController extends Controller
 
             return response()->noContent();
         } catch (\Throwable $e) {
-            logger('API Gateway delete error: ' . $e->getMessage() . ' at ' . $e->getFile() . ':' . $e->getLine());
+            $this->logApiError('API Gateway delete error', $e);
             throw new ApiException(500, 'api_error', 'Internal server error.', 'internal_error');
         }
     }
@@ -418,7 +422,7 @@ class GatewayController extends Controller
 
             return [];
         } catch (\Throwable $e) {
-            logger('API Gateway switch status error: ' . $e->getMessage() . ' at ' . $e->getFile() . ':' . $e->getLine());
+            $this->logApiError('API Gateway switch status error', $e);
 
             return [];
         }

@@ -2,6 +2,8 @@
 
 namespace App\Http\Controllers\Api\V1;
 
+use App\Http\Controllers\Api\V1\Concerns\LogsApiErrors;
+
 use App\Data\Api\V1\DialplanData;
 use App\Data\Api\V1\DialplanListResponseData;
 use App\Exceptions\ApiException;
@@ -27,6 +29,8 @@ use Illuminate\Http\Request;
  */
 class DialplanController extends Controller
 {
+    use LogsApiErrors;
+
     /** Fields the API takes as JSON booleans and v_dialplans stores as TEXT. */
     private const TEXT_BOOLEAN_FIELDS = ['dialplan_continue', 'dialplan_enabled', 'dialplan_destination'];
 
@@ -127,7 +131,7 @@ class DialplanController extends Controller
 
             return response()->json($payload->toArray(), 200);
         } catch (\Throwable $e) {
-            logger('API Dialplan index error: ' . $e->getMessage() . ' at ' . $e->getFile() . ':' . $e->getLine());
+            $this->logApiError('API Dialplan index error', $e);
             throw new ApiException(500, 'api_error', 'Internal server error.', 'internal_error');
         }
     }
@@ -182,7 +186,7 @@ class DialplanController extends Controller
                 ->json($data->toArray(), 201)
                 ->header('Location', "/api/v1/domains/{$domain_uuid}/dialplans/{$dialplan->dialplan_uuid}");
         } catch (\Throwable $e) {
-            logger('API Dialplan store error: ' . $e->getMessage() . ' at ' . $e->getFile() . ':' . $e->getLine());
+            $this->logApiError('API Dialplan store error', $e);
             throw new ApiException(500, 'api_error', 'Internal server error.', 'internal_error');
         }
     }
@@ -215,7 +219,7 @@ class DialplanController extends Controller
                 200
             );
         } catch (\Throwable $e) {
-            logger('API Dialplan show error: ' . $e->getMessage() . ' at ' . $e->getFile() . ':' . $e->getLine());
+            $this->logApiError('API Dialplan show error', $e);
             throw new ApiException(500, 'api_error', 'Internal server error.', 'internal_error');
         }
     }
@@ -268,7 +272,7 @@ class DialplanController extends Controller
                 200
             );
         } catch (\Throwable $e) {
-            logger('API Dialplan update error: ' . $e->getMessage() . ' at ' . $e->getFile() . ':' . $e->getLine());
+            $this->logApiError('API Dialplan update error', $e);
             throw new ApiException(500, 'api_error', 'Internal server error.', 'internal_error');
         }
     }
@@ -309,7 +313,7 @@ class DialplanController extends Controller
 
             return response()->noContent();
         } catch (\Throwable $e) {
-            logger('API Dialplan delete error: ' . $e->getMessage() . ' at ' . $e->getFile() . ':' . $e->getLine());
+            $this->logApiError('API Dialplan delete error', $e);
             throw new ApiException(500, 'api_error', 'Internal server error.', 'internal_error');
         }
     }

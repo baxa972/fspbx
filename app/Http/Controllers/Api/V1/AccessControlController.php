@@ -2,6 +2,8 @@
 
 namespace App\Http\Controllers\Api\V1;
 
+use App\Http\Controllers\Api\V1\Concerns\LogsApiErrors;
+
 use App\Data\Api\V1\AccessControlData;
 use App\Data\Api\V1\AccessControlListResponseData;
 use App\Exceptions\ApiException;
@@ -23,6 +25,8 @@ use Illuminate\Support\Facades\DB;
  */
 class AccessControlController extends Controller
 {
+    use LogsApiErrors;
+
     /**
      * List the access control lists of the instance
      *
@@ -74,7 +78,7 @@ class AccessControlController extends Controller
 
             return response()->json($payload->toArray(), 200);
         } catch (\Throwable $e) {
-            logger('API AccessControl index error: ' . $e->getMessage() . ' at ' . $e->getFile() . ':' . $e->getLine());
+            $this->logApiError('API AccessControl index error', $e);
             throw new ApiException(500, 'api_error', 'Internal server error.', 'internal_error');
         }
     }
@@ -179,7 +183,7 @@ class AccessControlController extends Controller
                 200
             );
         } catch (\Throwable $e) {
-            logger('API AccessControl update error: ' . $e->getMessage() . ' at ' . $e->getFile() . ':' . $e->getLine());
+            $this->logApiError('API AccessControl update error', $e);
             throw new ApiException(500, 'api_error', 'Internal server error.', 'internal_error');
         }
     }
