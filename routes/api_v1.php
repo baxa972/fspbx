@@ -12,6 +12,7 @@ use App\Http\Controllers\Api\V1\VoicemailController;
 use App\Http\Controllers\Api\V1\PhoneNumberController;
 use App\Http\Controllers\Api\V1\CdrController;
 use App\Http\Controllers\Api\V1\GatewayController;
+use App\Http\Controllers\Api\V1\AccessControlController;
 
 /*
 |--------------------------------------------------------------------------
@@ -218,6 +219,28 @@ Route::middleware(['auth:sanctum', 'api.token.auth', 'throttle:api'])->group(fun
 
     Route::post('/domains/{domain_uuid}/gateways/{gateway_uuid}/restart', [GatewayController::class, 'restart'])
         ->middleware('user.authorize:gateway_edit');
+
+
+    /*
+    |--------------------------------------------------------------------------
+    | Access Controls (global to the instance: v_access_controls has no domain)
+    |--------------------------------------------------------------------------
+    |
+    | /access-controls/reload is a literal segment declared BEFORE
+    | /access-controls/{access_control_uuid} so it can never be read as a UUID.
+    |
+    */
+    Route::get('/access-controls', [AccessControlController::class, 'index'])
+        ->middleware('user.authorize:access_control_view');
+
+    Route::post('/access-controls/reload', [AccessControlController::class, 'reload'])
+        ->middleware('user.authorize:access_control_view');
+
+    Route::get('/access-controls/{access_control_uuid}', [AccessControlController::class, 'show'])
+        ->middleware('user.authorize:access_control_view');
+
+    Route::patch('/access-controls/{access_control_uuid}', [AccessControlController::class, 'update'])
+        ->middleware('user.authorize:access_control_edit');
 
     // --- fin CallPulse additions ---
 });
