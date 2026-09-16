@@ -19,3 +19,13 @@ modules_statuses.json
 
 # Scribe generated docs/cache
 .scribe/
+# --- CallPulse additions ---
+# Sauvegardes laissées par les interventions manuelles sur la VM du standard.
+# Sans cette règle, `git status` y affiche en permanence des fichiers .bak, et
+# une VRAIE dérive — du code modifié à la main et jamais commité — se perd dans
+# ce bruit. C'est exactement ce qui est arrivé à la route `credentials`, restée
+# non commitée pendant des mois. Un `git status` propre redevient un signal.
+*.bak
+*.bak.*
+*.pre-*-fix.bak
+# --- fin CallPulse additions ---
