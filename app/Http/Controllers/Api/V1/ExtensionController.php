@@ -1506,4 +1506,50 @@ class ExtensionController extends Controller
             throw new ApiException(500, 'api_error', 'Internal server error.', 'internal_error');
         }
     }
+
+    /**
+     * Get SIP credentials (password) for an extension.
+     *
+     * Returns the plaintext SIP password stored in the database.
+     * This endpoint exists because the standard show() endpoint does not expose
+     * the password field for security reasons. Only callers with extension_view
+     * permission on the owning domain may call this endpoint.
+     *
+     * @group Extensions
+     * @authenticated
+     *
+     * @urlParam domain_uuid string required The domain UUID. Example: 4018f7a3-8e0a-47bb-9f4f-04b1313e0e1b
+     * @urlParam extension_uuid string required The extension UUID. Example: d2c7b17c-8b0d-4f0f-b5ff-2cfb6d7a4f4b
+     */
+    public function credentials(Request $request, string $domain_uuid, string $extension_uuid)
+    {
+        $user = $request->user();
+        if (! $user) {
+            throw new ApiException(401, 'authentication_error', 'Unauthenticated.', 'unauthenticated');
+        }
+
+        if (! preg_match('/^[0-9a-fA-F-]{36}$/', $domain_uuid)) {
+            throw new ApiException(400, 'invalid_request_error', 'Invalid domain UUID.', 'invalid_request', 'domain_uuid');
+        }
+
+        if (! preg_match('/^[0-9a-fA-F-]{36}$/', $extension_uuid)) {
+            throw new ApiException(400, 'invalid_request_error', 'Invalid extension UUID.', 'invalid_request', 'extension_uuid');
+        }
+
+        $ext = Extensions::query()
+            ->where('domain_uuid', $domain_uuid)
+            ->where('extension_uuid', $extension_uuid)
+            ->select(['extension_uuid', 'domain_uuid', 'extension', 'password'])
+            ->first();
+
+        if (! $ext) {
+            throw new ApiException(404, 'invalid_request_error', 'Extension not found.', 'resource_missing', 'extension_uuid');
+        }
+
+        return response()->json([
+            'extension_uuid' => (string) $ext->extension_uuid,
+            'extension'      => (string) $ext->extension,
+            'password'       => (string) $ext->password,
+        ]);
+    }
 }

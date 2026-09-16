@@ -62,6 +62,9 @@ Route::middleware(['auth:sanctum', 'api.token.auth', 'throttle:api'])->group(fun
     Route::patch('/domains/{domain_uuid}/extensions/{extension_uuid}', [ExtensionController::class, 'update'])
         ->middleware('user.authorize:extension_edit');
 
+    Route::get('/domains/{domain_uuid}/extensions/{extension_uuid}/credentials', [ExtensionController::class, 'credentials'])
+        ->middleware('user.authorize:extension_view');
+
     Route::delete('/domains/{domain_uuid}/extensions/{extension_uuid}', [ExtensionController::class, 'destroy'])
         ->middleware('user.authorize:extension_delete');
 
