@@ -10,6 +10,7 @@ use App\Models\User;
 use App\Services\Auth\PermissionService;
 use App\Services\AccessControlService;
 use App\Services\FreeswitchEslService;
+use App\Services\GatewayService;
 use Illuminate\Contracts\Validation\Validator as ValidatorContract;
 use Illuminate\Support\Facades\Route;
 use Illuminate\Support\Facades\Validator;
@@ -212,6 +213,86 @@ class GatewayApiTest extends TestCase
         $payload['enabled'] = 'oui';
 
         $this->assertArrayHasKey('enabled', $this->validateStore($payload)->errors()->toArray());
+    }
+
+    /**
+     * The profile name is interpolated into `sofia profile %s startgw / killgw
+     * / rescan` on the event socket: a space, a newline or a shell metachar
+     * would smuggle a second command. Letters, digits, _ and - only.
+     *
+     * @dataProvider unsafeProfileNames
+     */
+    public function test_create_rejects_an_unsafe_profile_name(string $profile): void
+    {
+        $payload = $this->validCreatePayload();
+        $payload['profile'] = $profile;
+
+        $this->assertArrayHasKey(
+            'profile',
+            $this->validateStore($payload)->errors()->toArray(),
+            "Profile '{$profile}' should have been refused."
+        );
+    }
+
+    public static function unsafeProfileNames(): array
+    {
+        return [
+            'space' => ['ext ernal'],
+            'newline' => ["external\nreloadxml"],
+            'semicolon' => ['external;reloadxml'],
+            'backtick' => ['external`id`'],
+            'command substitution' => ['external$(id)'],
+            'quote' => ["external'"],
+            'empty' => [''],
+        ];
+    }
+
+    /**
+     * @dataProvider safeProfileNames
+     */
+    public function test_create_accepts_a_safe_profile_name(string $profile): void
+    {
+        $payload = $this->validCreatePayload();
+        $payload['profile'] = $profile;
+
+        $this->assertArrayNotHasKey('profile', $this->validateStore($payload)->errors()->toArray());
+    }
+
+    public static function safeProfileNames(): array
+    {
+        return [
+            'external' => ['external'],
+            'internal' => ['internal'],
+            'ipv6 variant' => ['internal-ipv6'],
+            'underscore variant' => ['external_ipv6'],
+        ];
+    }
+
+    public function test_update_rejects_an_unsafe_profile_name(): void
+    {
+        $this->assertArrayHasKey(
+            'profile',
+            $this->validateUpdate(['profile' => "external\nreloadxml"])->errors()->toArray()
+        );
+    }
+
+    /**
+     * Defense in depth below the validation: even a profile name already in
+     * the database never reaches the event socket if it does not fit the
+     * alphabet — the command is refused before any connection attempt.
+     */
+    public function test_an_unsafe_stored_profile_never_reaches_the_event_socket(): void
+    {
+        $gateway = new Gateways();
+        $gateway->forceFill([
+            'gateway_uuid' => self::GATEWAY_UUID,
+            'profile' => "external\nreloadxml",
+            'enabled' => 'true',
+        ]);
+
+        $answer = app(GatewayService::class)->executeGatewayCommand('start', $gateway);
+
+        $this->assertSame('-ERR Refused: unsafe Sofia profile name.', $answer);
     }
 
     /**

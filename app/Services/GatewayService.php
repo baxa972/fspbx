@@ -9,6 +9,19 @@ use Illuminate\Support\Str;
 
 class GatewayService
 {
+    /**
+     * A Sofia profile name is interpolated into ESL commands (sofia profile
+     * %s startgw / killgw / rescan): anything but this alphabet could smuggle
+     * a second command. Letters, digits, underscore and dash cover every
+     * profile FusionPBX ships (internal, external, *-ipv6, …).
+     */
+    private const PROFILE_NAME_PATTERN = '/^[a-zA-Z0-9_-]+$/';
+
+    public static function isSafeProfileName(?string $profile): bool
+    {
+        return is_string($profile) && preg_match(self::PROFILE_NAME_PATTERN, $profile) === 1;
+    }
+
     public function saveData(array $validated, ?Gateways $gateway = null): array
     {
         $domainUuid = userCheckPermission('gateway_domain')
@@ -74,9 +87,17 @@ class GatewayService
             return 'Skipped: gateway is disabled.';
         }
 
+        $profile = $gateway->profile ?: 'external';
+
+        // Fail closed: a profile name that does not fit the alphabet never
+        // reaches the event socket, whatever the database holds.
+        if (! self::isSafeProfileName($profile)) {
+            return '-ERR Refused: unsafe Sofia profile name.';
+        }
+
         $command = match ($action) {
-            'start' => sprintf('sofia profile %s startgw %s', $gateway->profile ?: 'external', $gateway->gateway_uuid),
-            'stop' => sprintf('sofia profile %s killgw %s', $gateway->profile ?: 'external', $gateway->gateway_uuid),
+            'start' => sprintf('sofia profile %s startgw %s', $profile, $gateway->gateway_uuid),
+            'stop' => sprintf('sofia profile %s killgw %s', $profile, $gateway->gateway_uuid),
             default => null,
         };
 
@@ -112,9 +133,13 @@ class GatewayService
             return;
         }
 
-        $profiles->filter()->unique()->values()->each(function (string $profile) use ($service) {
-            $service->executeCommand("sofia profile {$profile} rescan", false);
-        });
+        $profiles->filter()
+            ->unique()
+            ->filter(fn (string $profile) => self::isSafeProfileName($profile))
+            ->values()
+            ->each(function (string $profile) use ($service) {
+                $service->executeCommand("sofia profile {$profile} rescan", false);
+            });
 
         $service->disconnect();
     }

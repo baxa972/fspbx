@@ -27,7 +27,8 @@ class UpdateGatewayRequest extends FormRequest
             'gateway'  => ['sometimes', 'string', 'max:255'],
             'proxy'    => ['sometimes', 'string', 'max:255'],
             'register' => ['sometimes', 'boolean'],
-            'profile'  => ['sometimes', 'string', 'max:255'],
+            // Interpolated into ESL commands: the alphabet is the guard.
+            'profile'  => ['sometimes', 'string', 'max:255', 'regex:/^[a-zA-Z0-9_-]+$/'],
             'enabled'  => ['sometimes', 'boolean'],
             'context'  => ['sometimes', 'string', 'max:255'],
 

@@ -20,7 +20,8 @@ class StoreGatewayRequest extends FormRequest
             'gateway'  => ['required', 'string', 'max:255'],
             'proxy'    => ['required', 'string', 'max:255'],
             'register' => ['required', 'boolean'],
-            'profile'  => ['required', 'string', 'max:255'],
+            // Interpolated into ESL commands: the alphabet is the guard.
+            'profile'  => ['required', 'string', 'max:255', 'regex:/^[a-zA-Z0-9_-]+$/'],
             'enabled'  => ['required', 'boolean'],
 
             // Credentials are mandatory as soon as the gateway registers.
