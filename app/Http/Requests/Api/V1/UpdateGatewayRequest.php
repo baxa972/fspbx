@@ -69,20 +69,19 @@ class UpdateGatewayRequest extends FormRequest
     }
 
     /**
-     * AccessControlService::normalizeCidr() silently drops anything it cannot parse,
-     * so an unusable CIDR must be refused here rather than vanish without a trace.
-     *
-     * Public so the rule can be exercised from a test without booting an HTTP request.
+     * Same guard as the creation: these CIDRs are written to the instance-wide
+     * `providers` ACL, so the PATCH ACL rule applies (see StoreGatewayRequest).
      */
     public function withValidator(Validator $validator): void
     {
         $validator->after(function (Validator $validator) {
             foreach ((array) $this->input('gateway_acl_cidrs', []) as $index => $cidr) {
-                if (! is_string($cidr) || ! StoreGatewayRequest::isUsableCidr($cidr)) {
-                    $validator->errors()->add(
-                        "gateway_acl_cidrs.{$index}",
-                        'Enter a valid IP address or CIDR range.'
-                    );
+                $reason = is_string($cidr)
+                    ? UpdateAccessControlRequest::cidrRejectionReason($cidr, 'deny')
+                    : 'Enter an IPv4 range as a.b.c.d/m, with octets between 0 and 255 and an explicit prefix length.';
+
+                if ($reason !== null) {
+                    $validator->errors()->add("gateway_acl_cidrs.{$index}", $reason);
                 }
             }
         });

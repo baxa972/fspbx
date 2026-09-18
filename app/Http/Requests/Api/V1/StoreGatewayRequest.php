@@ -63,46 +63,26 @@ class StoreGatewayRequest extends FormRequest
     }
 
     /**
-     * AccessControlService::normalizeCidr() silently drops anything it cannot parse,
-     * so an unusable CIDR must be refused here rather than vanish without a trace.
-     *
-     * Public so the rule can be exercised from a test without booting an HTTP request.
+     * These CIDRs land in the instance-wide `providers` access control list via
+     * AccessControlService::syncGatewayProviderIps() — the very list the PATCH
+     * ACL endpoint guards. They are therefore judged by the SAME rule, with the
+     * default policy the service writes on those lists: deny. A private block,
+     * 0.0.0.0/0, an IPv6 range or a prefix wider than /24 here would re-open
+     * exactly what UpdateAccessControlRequest refuses.
      */
     public function withValidator(Validator $validator): void
     {
         $validator->after(function (Validator $validator) {
             foreach ((array) $this->input('gateway_acl_cidrs', []) as $index => $cidr) {
-                if (! is_string($cidr) || ! self::isUsableCidr($cidr)) {
-                    $validator->errors()->add(
-                        "gateway_acl_cidrs.{$index}",
-                        'Enter a valid IP address or CIDR range.'
-                    );
+                $reason = is_string($cidr)
+                    ? UpdateAccessControlRequest::cidrRejectionReason($cidr, 'deny')
+                    : 'Enter an IPv4 range as a.b.c.d/m, with octets between 0 and 255 and an explicit prefix length.';
+
+                if ($reason !== null) {
+                    $validator->errors()->add("gateway_acl_cidrs.{$index}", $reason);
                 }
             }
         });
-    }
-
-    /**
-     * Mirrors what AccessControlService::normalizeCidr() is able to accept.
-     */
-    public static function isUsableCidr(string $value): bool
-    {
-        $parts = explode('/', str_replace('\\', '/', trim($value)), 2);
-        $ip = $parts[0] ?? '';
-
-        if (! filter_var($ip, FILTER_VALIDATE_IP)) {
-            return false;
-        }
-
-        $prefix = $parts[1] ?? null;
-
-        if ($prefix === null) {
-            return true;
-        }
-
-        $max = filter_var($ip, FILTER_VALIDATE_IP, FILTER_FLAG_IPV4) ? 32 : 128;
-
-        return is_numeric($prefix) && (int) $prefix >= 0 && (int) $prefix <= $max;
     }
 
     public function bodyParameters(): array

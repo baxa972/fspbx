@@ -110,6 +110,10 @@ class UpdateAccessControlRequest extends FormRequest
      * The whole rule, as a pure function so it can be exercised — and mutated —
      * without an HTTP request or a database.
      *
+     * Single source of the CIDR policy: the gateway endpoints consume it too,
+     * because StoreGatewayRequest / UpdateGatewayRequest write the very same
+     * `providers` list through AccessControlService::syncGatewayProviderIps().
+     *
      * @return string|null null when the CIDR is acceptable, otherwise the reason
      *                     it is refused.
      */

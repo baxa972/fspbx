@@ -214,8 +214,9 @@ class GatewayApiTest extends TestCase
     }
 
     /**
-     * AccessControlService::normalizeCidr() drops what it cannot parse without a
-     * word: an unusable CIDR must be refused here, not silently discarded.
+     * These CIDRs are written to the instance-wide `providers` ACL: the same rule
+     * as the PATCH access-controls endpoint applies — IPv4 with an explicit
+     * prefix, no private or reserved block, no /0, nothing wider than /24.
      *
      * @dataProvider unusableCidrs
      */
@@ -239,6 +240,19 @@ class GatewayApiTest extends TestCase
             'empty' => [''],
             'host name' => ['sip.example.com/32'],
             'negative prefix' => ['192.0.2.10/-1'],
+            // The ACL guard, applied to what syncGatewayProviderIps() writes:
+            'private 10/8' => ['10.0.0.0/8'],
+            'private host inside 10/8' => ['10.1.2.3/32'],
+            'private 172.16/12' => ['172.16.0.0/12'],
+            'private 192.168/16' => ['192.168.0.0/16'],
+            'loopback' => ['127.0.0.1/32'],
+            'carrier grade nat' => ['100.64.0.0/10'],
+            'the whole internet' => ['0.0.0.0/0'],
+            'wider than /24' => ['192.0.2.0/23'],
+            'ipv4 without prefix' => ['192.0.2.10'],
+            'ipv6' => ['2001:db8::1/128'],
+            'ipv6 whole internet' => ['::/0'],
+            'numeric-looking float prefix' => ['192.0.2.1/24e0'],
         ];
     }
 
@@ -258,8 +272,7 @@ class GatewayApiTest extends TestCase
         return [
             'ipv4 host' => ['192.0.2.10/32'],
             'ipv4 range' => ['198.51.100.0/24'],
-            'ipv4 without prefix' => ['192.0.2.10'],
-            'ipv6' => ['2001:db8::1/128'],
+            'narrower than /24' => ['203.0.113.0/28'],
         ];
     }
 
@@ -291,6 +304,18 @@ class GatewayApiTest extends TestCase
         $this->assertArrayHasKey(
             'gateway_acl_cidrs.0',
             $this->validateUpdate(['gateway_acl_cidrs' => ['192.0.2.10/33']])->errors()->toArray()
+        );
+    }
+
+    /**
+     * A PATCH is a whole-list replacement too: a private block must be refused
+     * here exactly as on creation.
+     */
+    public function test_update_rejects_a_private_acl_cidr(): void
+    {
+        $this->assertArrayHasKey(
+            'gateway_acl_cidrs.0',
+            $this->validateUpdate(['gateway_acl_cidrs' => ['10.0.0.0/8']])->errors()->toArray()
         );
     }
 
