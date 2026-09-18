@@ -8,6 +8,7 @@ use App\Http\Requests\Api\V1\UpdateGatewayRequest;
 use App\Models\Gateways;
 use App\Models\User;
 use App\Services\Auth\PermissionService;
+use App\Services\AccessControlService;
 use App\Services\FreeswitchEslService;
 use Illuminate\Contracts\Validation\Validator as ValidatorContract;
 use Illuminate\Support\Facades\Route;
@@ -316,6 +317,52 @@ class GatewayApiTest extends TestCase
         $this->assertArrayHasKey(
             'gateway_acl_cidrs.0',
             $this->validateUpdate(['gateway_acl_cidrs' => ['10.0.0.0/8']])->errors()->toArray()
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // ACL list naming — unique per gateway, across tenants
+    // -----------------------------------------------------------------------
+
+    /**
+     * access_control_name is not scoped by domain_uuid: two tenants calling
+     * their trunk "ovh" must NOT share one list. The name is derived from the
+     * immutable UUID, never from the display name.
+     */
+    public function test_the_acl_list_is_named_after_the_uuid_not_the_display_name(): void
+    {
+        $service = app(AccessControlService::class);
+
+        $first = new Gateways();
+        $first->forceFill(['gateway_uuid' => self::GATEWAY_UUID, 'gateway' => 'ovh']);
+
+        $second = new Gateways();
+        $second->forceFill(['gateway_uuid' => 'eeeeeeee-1111-2222-3333-444444444444', 'gateway' => 'ovh']);
+
+        $this->assertSame('gateway_' . self::GATEWAY_UUID, $service->gatewayListName($first));
+        $this->assertSame('gateway_eeeeeeee-1111-2222-3333-444444444444', $service->gatewayListName($second));
+        $this->assertNotSame(
+            $service->gatewayListName($first),
+            $service->gatewayListName($second),
+            'Two gateways with the same display name must not share an ACL list.'
+        );
+    }
+
+    /**
+     * mirrorManagedGatewayList() parses the UUID back out of the list name
+     * (gatewayUuidFromListName): the format is part of the contract.
+     */
+    public function test_the_acl_list_name_keeps_the_parseable_format(): void
+    {
+        $service = app(AccessControlService::class);
+
+        $gateway = new Gateways();
+        // An upper-case UUID must normalize to the lower-case canonical form.
+        $gateway->forceFill(['gateway_uuid' => strtoupper(self::GATEWAY_UUID), 'gateway' => 'ovh']);
+
+        $this->assertMatchesRegularExpression(
+            '/^gateway_[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/',
+            $service->gatewayListName($gateway)
         );
     }
 
