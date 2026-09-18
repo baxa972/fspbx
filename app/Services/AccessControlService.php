@@ -239,12 +239,16 @@ class AccessControlService
             : null;
     }
 
+    /**
+     * Named after the immutable gateway UUID, never the display name:
+     * access_control_name is NOT scoped by domain_uuid, so two tenants calling
+     * their trunk "ovh" would otherwise share one "ovh Provider IPs" list —
+     * each sync erasing the other tenant's nodes, each delete destroying the
+     * shared list. This is also the format gatewayUuidFromListName() parses.
+     */
     public function gatewayListName(Gateways $gateway): string
     {
-        $name = trim((string) ($gateway->gateway ?: $gateway->gateway_uuid));
-        $name = preg_replace('/\s+/', ' ', $name);
-
-        return substr($name . ' Provider IPs', 0, 255);
+        return 'gateway_' . strtolower((string) $gateway->gateway_uuid);
     }
 
     private function deleteGatewayProviderNodes(Gateways $gateway): void
@@ -288,13 +292,13 @@ class AccessControlService
     private function managedGatewayLists(Gateways $gateway): Collection
     {
         $description = $this->gatewayNodeDescription($gateway);
-        $legacyName = 'gateway_' . strtolower((string) $gateway->gateway_uuid);
         $currentName = $this->gatewayListName($gateway);
 
+        // The description match is what finds a list created before the names
+        // moved to gateway_<uuid>: such a list carries this gateway's nodes.
         return AccessControl::query()
-            ->where(function ($query) use ($description, $legacyName, $currentName) {
-                $query->where('access_control_name', $legacyName)
-                    ->orWhere('access_control_name', $currentName)
+            ->where(function ($query) use ($description, $currentName) {
+                $query->where('access_control_name', $currentName)
                     ->orWhereHas('nodes', function ($query) use ($description) {
                         $query->where('node_description', $description);
                     });

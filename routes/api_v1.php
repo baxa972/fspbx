@@ -11,6 +11,9 @@ use App\Http\Controllers\Api\V1\RingGroupController;
 use App\Http\Controllers\Api\V1\VoicemailController;
 use App\Http\Controllers\Api\V1\PhoneNumberController;
 use App\Http\Controllers\Api\V1\CdrController;
+use App\Http\Controllers\Api\V1\GatewayController;
+use App\Http\Controllers\Api\V1\AccessControlController;
+use App\Http\Controllers\Api\V1\DialplanController;
 
 /*
 |--------------------------------------------------------------------------
@@ -195,4 +198,77 @@ Route::middleware(['auth:sanctum', 'api.token.auth', 'throttle:api'])->group(fun
 
     Route::get('/domains/{domain_uuid}/cdrs/{xml_cdr_uuid}/recording-url', [CdrController::class, 'recordingUrl'])
         ->middleware('user.authorize:xml_cdr_view');
+
+    // --- CallPulse additions ---
+
+    /*
+    |--------------------------------------------------------------------------
+    | Gateways (domain-scoped)
+    |--------------------------------------------------------------------------
+    */
+    Route::post('/domains/{domain_uuid}/gateways', [GatewayController::class, 'store'])
+        ->middleware('user.authorize:gateway_add');
+
+    Route::get('/domains/{domain_uuid}/gateways/{gateway_uuid}', [GatewayController::class, 'show'])
+        ->middleware('user.authorize:gateway_view');
+
+    Route::patch('/domains/{domain_uuid}/gateways/{gateway_uuid}', [GatewayController::class, 'update'])
+        ->middleware('user.authorize:gateway_edit');
+
+    Route::delete('/domains/{domain_uuid}/gateways/{gateway_uuid}', [GatewayController::class, 'destroy'])
+        ->middleware('user.authorize:gateway_delete');
+
+    Route::post('/domains/{domain_uuid}/gateways/{gateway_uuid}/restart', [GatewayController::class, 'restart'])
+        ->middleware('user.authorize:gateway_edit');
+
+
+    /*
+    |--------------------------------------------------------------------------
+    | Access Controls (global to the instance: v_access_controls has no domain)
+    |--------------------------------------------------------------------------
+    |
+    | /access-controls/reload is a literal segment declared BEFORE
+    | /access-controls/{access_control_uuid} so it can never be read as a UUID.
+    |
+    */
+    Route::get('/access-controls', [AccessControlController::class, 'index'])
+        ->middleware('user.authorize:access_control_view');
+
+    Route::post('/access-controls/reload', [AccessControlController::class, 'reload'])
+        ->middleware('user.authorize:access_control_view');
+
+    Route::get('/access-controls/{access_control_uuid}', [AccessControlController::class, 'show'])
+        ->middleware('user.authorize:access_control_view');
+
+    Route::patch('/access-controls/{access_control_uuid}', [AccessControlController::class, 'update'])
+        ->middleware('user.authorize:access_control_edit');
+
+    /*
+    |--------------------------------------------------------------------------
+    | Dialplans (domain-scoped)
+    |--------------------------------------------------------------------------
+    |
+    | /dialplans/reload is a literal segment declared BEFORE
+    | /dialplans/{dialplan_uuid} so it can never be read as a UUID.
+    |
+    */
+    Route::get('/domains/{domain_uuid}/dialplans', [DialplanController::class, 'index'])
+        ->middleware('user.authorize:dialplan_view');
+
+    Route::post('/domains/{domain_uuid}/dialplans', [DialplanController::class, 'store'])
+        ->middleware('user.authorize:dialplan_add');
+
+    Route::post('/domains/{domain_uuid}/dialplans/reload', [DialplanController::class, 'reload'])
+        ->middleware('user.authorize:dialplan_view');
+
+    Route::get('/domains/{domain_uuid}/dialplans/{dialplan_uuid}', [DialplanController::class, 'show'])
+        ->middleware('user.authorize:dialplan_view');
+
+    Route::patch('/domains/{domain_uuid}/dialplans/{dialplan_uuid}', [DialplanController::class, 'update'])
+        ->middleware('user.authorize:dialplan_edit');
+
+    Route::delete('/domains/{domain_uuid}/dialplans/{dialplan_uuid}', [DialplanController::class, 'destroy'])
+        ->middleware('user.authorize:dialplan_delete');
+
+    // --- fin CallPulse additions ---
 });

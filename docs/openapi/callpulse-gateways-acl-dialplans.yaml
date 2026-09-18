@@ -1,0 +1,1799 @@
+openapi: 3.0.3
+
+info:
+  title: 'FS PBX API v1 — Gateways, Access Controls, Dialplans'
+  version: 1.0.0
+  description: |
+    Contrat des trois ressources ajoutées à l'API v1 de FS PBX pour CallPulse :
+    passerelles SIP (`gateways`), listes de contrôle d'accès (`access-controls`)
+    et plans de numérotation (`dialplans`).
+
+    Ce document est le contrat de référence : il est écrit avant les contrôleurs
+    et fait foi en cas de divergence avec une implémentation.
+
+    ## Authentification
+
+    Toutes les opérations exigent un jeton personnel Sanctum envoyé en
+    `Authorization: Bearer <token>`. Deux couches distinctes s'appliquent, dans
+    cet ordre, et **elles ne renvoient pas la même forme de corps d'erreur** :
+
+    1. `RequireBearerToken` — en-tête `Authorization` absent → `401`
+       `{"success": false, "message": "Bearer token required."}` (forme « middleware »).
+    2. `auth:sanctum` — jeton présent mais invalide ou révoqué → `401`
+       `{"error": {"type": "authentication_error", ...}}` (forme « enveloppe »).
+    3. `AuthorizeUser` — permission manquante → `403` forme « middleware » avec
+       `error.code = "forbidden_permission"` ; domaine hors périmètre de
+       l'utilisateur → `403` forme « enveloppe » avec `error.code = "forbidden_domain"`.
+
+    Un client doit donc accepter les **deux** formes sur `401` et sur `403`.
+
+    ## Débit
+
+    Limiteur `throttle:api` : **60 requêtes par minute** par utilisateur
+    authentifié (à défaut, par adresse IP). Dépassement → `429`.
+
+    ## Codes de retour
+
+    | Code | Signification |
+    |---|---|
+    | `200` | Lecture, modification, rechargement |
+    | `201` | Création (avec en-tête `Location`) |
+    | `202` | Redémarrage de passerelle accepté |
+    | `204` | Suppression effectuée, sans corps |
+    | `400` | UUID malformé **ou corps invalide** — la validation FormRequest est rendue en `400` par le gestionnaire d'exceptions de l'API v1, **jamais en `422`** |
+    | `401` | Jeton absent, invalide ou révoqué |
+    | `403` | Permission manquante, ou domaine hors périmètre |
+    | `404` | Ressource inexistante, ou hors du domaine appelé |
+    | `422` | **Le moteur téléphonique (FreeSWITCH, via l'event socket) a répondu une erreur** sur un rechargement ou un redémarrage |
+    | `429` | Débit dépassé |
+    | `500` | Erreur interne |
+
+    ## `switch_response` — un `201` ne prouve pas que FreeSWITCH a pris la configuration
+
+    Les écritures en base et les effets sur le moteur téléphonique sont deux
+    étapes distinctes. L'event socket est **silencieux en cas de panne** : le
+    service renvoie la chaîne sentinelle
+    `-ERR Could not connect to FreeSWITCH event socket.` sans lever d'exception.
+
+    - Sur **création** et **modification**, la ressource est persistée puis les
+      commandes moteur sont émises hors transaction. La réponse reste `201`/`200`,
+      et le résultat brut du moteur est porté par `switch_response` (et
+      `acl_response` pour les passerelles). **Un client doit inspecter ces champs :
+      une valeur commençant par `-ERR` signifie que la base est à jour mais que
+      FreeSWITCH ignore encore la configuration** (une passerelle non rescannée est
+      invisible de Sofia).
+    - Sur **rechargement** (`/access-controls/reload`, `/dialplans/reload`) et
+      **redémarrage** (`/gateways/{gateway_uuid}/restart`), une réponse moteur
+      commençant par `-ERR` produit un `422` avec `error.code = "switch_error"` :
+      un rechargement qui échoue n'est jamais présenté comme un succès.
+
+    ## Ordre de déclaration des routes (note d'implémentation)
+
+    `/access-controls/reload` et `/domains/{domain_uuid}/dialplans/reload` sont des
+    segments **littéraux** en concurrence avec `/access-controls/{access_control_uuid}`
+    et `/domains/{domain_uuid}/dialplans/{dialplan_uuid}`. Ils doivent être déclarés
+    **avant** les routes paramétrées, sinon `reload` est capté comme un UUID et
+    répond `400`/`404`.
+
+  contact:
+    name: 'CallPulse — plateforme Voice AI'
+
+servers:
+  - url: 'https://{host}'
+    description: 'Instance FS PBX'
+    variables:
+      host:
+        default: YOUR-FSPBX-HOST
+        description: "Nom d'hôte de l'instance FS PBX (exemple : pbx.exemple.fr)"
+
+security:
+  - bearerAuth: []
+
+tags:
+  - name: Gateways
+    description: |
+      Passerelles SIP sortantes d'un domaine (`v_gateways`). Une passerelle est
+      nommée dans Sofia par son `gateway_uuid`, jamais par son nom logique : un
+      dialplan qui la ponte écrit `sofia/gateway/<gateway_uuid>/<destination>`.
+  - name: 'Access Controls'
+    description: |
+      Listes de contrôle d'accès FreeSWITCH (`v_access_controls`). **Globales à
+      l'instance** : la table ne porte pas de `domain_uuid`, les chemins sont donc
+      hors de `/domains/`. Toute modification est visible par tous les tenants.
+  - name: Dialplans
+    description: |
+      Plans de numérotation d'un domaine (`v_dialplans` et `v_dialplan_details`).
+
+paths:
+
+  # ---------------------------------------------------------------------------
+  # Gateways
+  # ---------------------------------------------------------------------------
+
+  '/api/v1/domains/{domain_uuid}/gateways':
+    post:
+      tags: [Gateways]
+      operationId: createGateway
+      summary: 'Créer une passerelle SIP'
+      description: |
+        Crée une passerelle dans le domaine indiqué, puis, hors transaction :
+        recharge les listes d'accès (`reloadacl`), rescanne le profil Sofia
+        (`sofia profile <profile> rescan`) et démarre la passerelle
+        (`sofia profile <profile> startgw <gateway_uuid>`) si `enabled` vaut `true`.
+
+        Le `domain_uuid` de la route est la **seule** source de vérité pour le
+        rattachement : un `domain_uuid` présent dans le corps est ignoré.
+
+        Les résultats bruts du moteur sont renvoyés dans `switch_response`
+        (démarrage) et `acl_response` (rechargement des listes d'accès) — voir
+        « `switch_response` » en introduction : un `201` ne garantit pas la prise
+        en compte par FreeSWITCH.
+
+        Permission requise : `gateway_add`.
+      parameters:
+        - $ref: '#/components/parameters/DomainUuid'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/GatewayCreateRequest'
+            examples:
+              telnyx:
+                summary: 'Passerelle sortante vers un opérateur, avec liste blanche d''IP'
+                value:
+                  gateway: client_poste_250
+                  proxy: 'sip.exemple-operateur.fr:5060'
+                  register: true
+                  username: '250'
+                  password: 'mot-de-passe-fourni-par-l-operateur'
+                  from_user: '250'
+                  from_domain: exemple-operateur.fr
+                  register_transport: udp
+                  expire_seconds: 800
+                  ping: 30
+                  profile: external
+                  context: public
+                  enabled: true
+                  description: 'Poste 250 — raccordement CallPulse'
+                  gateway_acl_cidrs:
+                    - 192.0.2.10/32
+                    - 198.51.100.0/24
+      responses:
+        201:
+          description: 'Passerelle créée.'
+          headers:
+            Location:
+              description: 'URL de la passerelle créée.'
+              schema:
+                type: string
+                example: '/api/v1/domains/4018f7a3-8e0a-47bb-9f4f-04b1313e0e1b/gateways/47aa96db-3f70-46ce-bb9a-79ccef396f2b'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Gateway'
+        400: { $ref: '#/components/responses/BadRequest' }
+        401: { $ref: '#/components/responses/Unauthorized' }
+        403: { $ref: '#/components/responses/Forbidden' }
+        404: { $ref: '#/components/responses/NotFound' }
+        429: { $ref: '#/components/responses/TooManyRequests' }
+        500: { $ref: '#/components/responses/InternalError' }
+
+  '/api/v1/domains/{domain_uuid}/gateways/{gateway_uuid}':
+    get:
+      tags: [Gateways]
+      operationId: getGateway
+      summary: 'Lire une passerelle et son état d''enregistrement'
+      description: |
+        Renvoie la configuration persistée **et** l'état vu par le moteur
+        téléphonique, lu sur l'event socket (`sofia xmlstatus gateway`, la même
+        source que l'interface d'administration) et rapproché par `gateway_uuid`.
+
+        Si l'event socket est injoignable, `state` vaut `UNKNOWN` et
+        `ping_state` / `ping_time_ms` sont `null` : l'absence d'état n'est pas
+        une absence de passerelle.
+
+        Permission requise : `gateway_view`.
+      parameters:
+        - $ref: '#/components/parameters/DomainUuid'
+        - $ref: '#/components/parameters/GatewayUuid'
+      responses:
+        200:
+          description: Succès.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Gateway'
+        400: { $ref: '#/components/responses/BadRequest' }
+        401: { $ref: '#/components/responses/Unauthorized' }
+        403: { $ref: '#/components/responses/Forbidden' }
+        404: { $ref: '#/components/responses/NotFound' }
+        429: { $ref: '#/components/responses/TooManyRequests' }
+        500: { $ref: '#/components/responses/InternalError' }
+
+    patch:
+      tags: [Gateways]
+      operationId: updateGateway
+      summary: 'Modifier partiellement une passerelle'
+      description: |
+        Modification **partielle** : seuls les champs présents dans le corps sont
+        appliqués, les autres conservent leur valeur. Aucun champ n'est requis.
+
+        Si `profile` change, l'ancien **et** le nouveau profil Sofia sont
+        rescannés. Envoyer `gateway_acl_cidrs` remplace intégralement la liste
+        blanche d'IP de cette passerelle ; envoyer un tableau vide la supprime.
+
+        `password` s'écrit mais ne se relit jamais (voir le schéma `Gateway`).
+
+        Permission requise : `gateway_edit`.
+      parameters:
+        - $ref: '#/components/parameters/DomainUuid'
+        - $ref: '#/components/parameters/GatewayUuid'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/GatewayUpdateRequest'
+            examples:
+              desactiver:
+                summary: 'Désactiver la passerelle'
+                value:
+                  enabled: false
+      responses:
+        200:
+          description: 'Passerelle modifiée.'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Gateway'
+        400: { $ref: '#/components/responses/BadRequest' }
+        401: { $ref: '#/components/responses/Unauthorized' }
+        403: { $ref: '#/components/responses/Forbidden' }
+        404: { $ref: '#/components/responses/NotFound' }
+        429: { $ref: '#/components/responses/TooManyRequests' }
+        500: { $ref: '#/components/responses/InternalError' }
+
+    delete:
+      tags: [Gateways]
+      operationId: deleteGateway
+      summary: 'Supprimer une passerelle'
+      description: |
+        Arrête la passerelle sur le moteur (`sofia profile <profile> killgw
+        <gateway_uuid>`) **avant** de la supprimer en base, retire les nœuds de
+        liste blanche qu'elle possédait, puis recharge les listes d'accès et
+        rescanne le profil.
+
+        Réponse **`204 No Content`, sans corps**.
+
+        Permission requise : `gateway_delete`.
+      parameters:
+        - $ref: '#/components/parameters/DomainUuid'
+        - $ref: '#/components/parameters/GatewayUuid'
+      responses:
+        204:
+          description: 'Passerelle supprimée. Aucun corps de réponse.'
+        400: { $ref: '#/components/responses/BadRequest' }
+        401: { $ref: '#/components/responses/Unauthorized' }
+        403: { $ref: '#/components/responses/Forbidden' }
+        404: { $ref: '#/components/responses/NotFound' }
+        429: { $ref: '#/components/responses/TooManyRequests' }
+        500: { $ref: '#/components/responses/InternalError' }
+
+  '/api/v1/domains/{domain_uuid}/gateways/{gateway_uuid}/restart':
+    post:
+      tags: [Gateways]
+      operationId: restartGateway
+      summary: 'Redémarrer une passerelle sur le moteur téléphonique'
+      description: |
+        Rescanne le profil Sofia puis redémarre la passerelle
+        (`sofia profile <profile> startgw <gateway_uuid>`). Aucune écriture en base.
+
+        Opération **asynchrone du point de vue du moteur** : `202` signifie que la
+        commande a été acceptée, pas que la passerelle est réenregistrée. Interroger
+        `GET /gateways/{gateway_uuid}` pour observer le passage à `REGED`.
+
+        - Passerelle désactivée (`enabled = false`) → `202` avec
+          `switch_response = "Skipped: gateway is disabled."` (aucune commande émise).
+        - Réponse moteur commençant par `-ERR` (event socket injoignable compris)
+          → `422` avec `error.code = "switch_error"`.
+
+        Sans corps de requête.
+
+        Permission requise : `gateway_edit`.
+      parameters:
+        - $ref: '#/components/parameters/DomainUuid'
+        - $ref: '#/components/parameters/GatewayUuid'
+      responses:
+        202:
+          description: 'Commande de redémarrage acceptée par le moteur.'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/GatewayRestartAccepted'
+        400: { $ref: '#/components/responses/BadRequest' }
+        401: { $ref: '#/components/responses/Unauthorized' }
+        403: { $ref: '#/components/responses/Forbidden' }
+        404: { $ref: '#/components/responses/NotFound' }
+        422: { $ref: '#/components/responses/SwitchError' }
+        429: { $ref: '#/components/responses/TooManyRequests' }
+        500: { $ref: '#/components/responses/InternalError' }
+
+  # ---------------------------------------------------------------------------
+  # Access Controls — GLOBALES à l'instance, donc hors de /domains/
+  # ---------------------------------------------------------------------------
+
+  '/api/v1/access-controls':
+    get:
+      tags: ['Access Controls']
+      operationId: listAccessControls
+      summary: 'Lister les listes de contrôle d''accès de l''instance'
+      description: |
+        Renvoie toutes les listes d'accès de l'instance, **sans leurs nœuds**
+        (utiliser `GET /access-controls/{access_control_uuid}` pour les obtenir).
+
+        Ces listes sont **globales** : elles ne sont pas filtrées par domaine,
+        parce que `v_access_controls` ne porte pas de `domain_uuid`. Un appelant
+        voit donc les listes de tous les tenants de l'instance.
+
+        La réponse suit l'enveloppe de liste de l'API v1
+        (`object`, `url`, `has_more`, `data`). Cette collection n'est pas paginée :
+        `has_more` vaut toujours `false`.
+
+        Permission requise : `access_control_view`.
+      responses:
+        200:
+          description: Succès.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AccessControlListResponse'
+        401: { $ref: '#/components/responses/Unauthorized' }
+        403: { $ref: '#/components/responses/Forbidden' }
+        429: { $ref: '#/components/responses/TooManyRequests' }
+        500: { $ref: '#/components/responses/InternalError' }
+
+  '/api/v1/access-controls/reload':
+    post:
+      tags: ['Access Controls']
+      operationId: reloadAccessControls
+      summary: 'Recharger les listes d''accès dans FreeSWITCH'
+      description: |
+        Invalide le cache de configuration `acl.conf` puis émet `reloadacl` sur
+        l'event socket. Aucune écriture en base.
+
+        Une réponse moteur commençant par `-ERR` — event socket injoignable
+        compris — produit un `422` : un rechargement qui n'a pas eu lieu n'est
+        jamais renvoyé en succès. C'est ce qui empêche de croire à une liste
+        blanche appliquée alors que `iptables` bloque encore le fournisseur.
+
+        Sans corps de requête.
+
+        Note d'implémentation : cette route littérale doit être déclarée **avant**
+        `/access-controls/{access_control_uuid}`.
+
+        Permission requise : `access_control_view`.
+      responses:
+        200:
+          description: 'Rechargement effectué.'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AccessControlReloadResponse'
+        401: { $ref: '#/components/responses/Unauthorized' }
+        403: { $ref: '#/components/responses/Forbidden' }
+        422: { $ref: '#/components/responses/SwitchError' }
+        429: { $ref: '#/components/responses/TooManyRequests' }
+        500: { $ref: '#/components/responses/InternalError' }
+
+  '/api/v1/access-controls/{access_control_uuid}':
+    get:
+      tags: ['Access Controls']
+      operationId: getAccessControl
+      summary: 'Lire une liste d''accès et l''intégralité de ses nœuds'
+      description: |
+        Renvoie la liste et **tous** ses nœuds. C'est la lecture à effectuer avant
+        toute modification : `PATCH` remplace l'intégralité des nœuds, il faut donc
+        partir de la liste complète (voir `PATCH`).
+
+        Permission requise : `access_control_view`.
+      parameters:
+        - $ref: '#/components/parameters/AccessControlUuid'
+      responses:
+        200:
+          description: Succès.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AccessControl'
+        400: { $ref: '#/components/responses/BadRequest' }
+        401: { $ref: '#/components/responses/Unauthorized' }
+        403: { $ref: '#/components/responses/Forbidden' }
+        404: { $ref: '#/components/responses/NotFound' }
+        429: { $ref: '#/components/responses/TooManyRequests' }
+        500: { $ref: '#/components/responses/InternalError' }
+
+    patch:
+      tags: ['Access Controls']
+      operationId: updateAccessControl
+      summary: 'Modifier une liste d''accès — les nœuds sont REMPLACÉS EN ENTIER'
+      description: |
+        ## ⚠️ `nodes` est un remplacement total, jamais un ajout
+
+        Le champ `nodes` reçoit **la liste complète et définitive** des nœuds.
+        Le service supprime tous les nœuds existants de la liste, puis réinsère
+        exactement ceux reçus.
+
+        **Toute entrée omise est supprimée.** Envoyer un seul nœud pour « ajouter
+        une IP » efface toutes les autres, y compris les autorisations d'un autre
+        client de l'instance — les listes d'accès sont globales. La séquence
+        correcte est toujours : `GET /access-controls/{access_control_uuid}`,
+        modifier le tableau `nodes` reçu, puis renvoyer **ce tableau entier**.
+        Envoyer `nodes: []` vide la liste.
+
+        Un `node_cidr` que le service ne sait pas normaliser est **ignoré
+        silencieusement** : il disparaît sans erreur. C'est pourquoi chaque CIDR est
+        validé en amont et qu'un CIDR invalide produit un `400` plutôt qu'une liste
+        amputée. Sont refusés, en plus des valeurs syntaxiquement invalides :
+        `0.0.0.0/0`, les plages privées ou réservées (`10.0.0.0/8`, `172.16.0.0/12`,
+        `192.168.0.0/16`, `127.0.0.0/8`, `100.64.0.0/10`) et tout masque plus large
+        que `/24` sur une liste dont `access_control_default` vaut `deny`.
+
+        ## Les attributs de la liste sont partiels, mais à envoyer complets
+
+        `access_control_name`, `access_control_default` et
+        `access_control_description` sont réécrits à chaque appel. Le contrôleur
+        complète les champs absents avec les valeurs courantes de la liste, de sorte
+        qu'un `PATCH` ne portant que `nodes` ne modifie ni le nom, ni le défaut, ni
+        la description. Un client qui veut changer le défaut doit l'envoyer
+        explicitement.
+
+        Après écriture, le cache `acl.conf` est invalidé et `reloadacl` est émis ;
+        le résultat brut est renvoyé dans `switch_response` (la réponse reste `200`,
+        voir « `switch_response` » en introduction).
+
+        Ni la création ni la suppression d'une liste ne sont exposées par cette API.
+
+        Permission requise : `access_control_edit`.
+      parameters:
+        - $ref: '#/components/parameters/AccessControlUuid'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AccessControlUpdateRequest'
+            examples:
+              remplacement_complet:
+                summary: 'Liste complète des nœuds autorisés (les absents sont supprimés)'
+                value:
+                  nodes:
+                    - node_type: allow
+                      node_cidr: 192.0.2.10/32
+                      node_description: 'Opérateur — SBC 1'
+                    - node_type: allow
+                      node_cidr: 198.51.100.0/24
+                      node_description: 'Opérateur — plage média'
+      responses:
+        200:
+          description: 'Liste modifiée ; ses nœuds sont ceux renvoyés.'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AccessControl'
+        400: { $ref: '#/components/responses/BadRequest' }
+        401: { $ref: '#/components/responses/Unauthorized' }
+        403: { $ref: '#/components/responses/Forbidden' }
+        404: { $ref: '#/components/responses/NotFound' }
+        429: { $ref: '#/components/responses/TooManyRequests' }
+        500: { $ref: '#/components/responses/InternalError' }
+
+  # ---------------------------------------------------------------------------
+  # Dialplans
+  # ---------------------------------------------------------------------------
+
+  '/api/v1/domains/{domain_uuid}/dialplans':
+    get:
+      tags: [Dialplans]
+      operationId: listDialplans
+      summary: 'Lister les plans de numérotation d''un domaine'
+      description: |
+        Liste paginée **par curseur**, dans l'enveloppe de liste de l'API v1.
+        Les éléments ne portent pas leurs lignes de détail : utiliser
+        `GET /dialplans/{dialplan_uuid}` pour les obtenir.
+
+        Pagination : `limit` (défaut 50, borné 1–100) et `starting_after`
+        (le `dialplan_uuid` du dernier élément de la page précédente).
+        **Il n'y a ni `page` ni `per_page`.**
+
+        Permission requise : `dialplan_view`.
+      parameters:
+        - $ref: '#/components/parameters/DomainUuid'
+        - $ref: '#/components/parameters/Limit'
+        - name: starting_after
+          in: query
+          required: false
+          description: 'Renvoyer les résultats situés après ce `dialplan_uuid`.'
+          schema:
+            type: string
+            format: uuid
+          example: 8c0f2b1d-1f2e-4a3b-9c4d-5e6f7a8b9c0d
+      responses:
+        200:
+          description: Succès.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DialplanListResponse'
+        400: { $ref: '#/components/responses/BadRequest' }
+        401: { $ref: '#/components/responses/Unauthorized' }
+        403: { $ref: '#/components/responses/Forbidden' }
+        404: { $ref: '#/components/responses/NotFound' }
+        429: { $ref: '#/components/responses/TooManyRequests' }
+        500: { $ref: '#/components/responses/InternalError' }
+
+    post:
+      tags: [Dialplans]
+      operationId: createDialplan
+      summary: 'Créer un plan de numérotation et ses lignes de détail'
+      description: |
+        Écrit le plan (`v_dialplans`) **et** ses lignes de détail
+        (`v_dialplan_details`) dans une même transaction, invalide le cache de
+        dialplan du contexte, puis émet `bgapi reloadxml` sur l'event socket.
+
+        Le `domain_uuid` de la route est la seule source de vérité ; un
+        `domain_uuid` dans le corps est ignoré.
+
+        ## Deux modes d'écriture, exclusifs l'un de l'autre
+
+        - `editor_mode: "builder"` (**défaut**) — le XML FreeSWITCH est **construit
+          à partir de `details`**. Un `dialplan_xml` envoyé dans ce mode est ignoré.
+        - `editor_mode: "xml"` — le `dialplan_xml` fourni est enregistré tel quel et
+          **`details` est ignoré : aucune ligne de détail n'est créée**.
+
+        Choisir le mauvais mode produit un `201` sur un plan vide de détails ou sur
+        un XML jamais pris en compte : le mode doit être choisi explicitement dès
+        que les deux champs sont envoyés.
+
+        ## Lignes de détail
+
+        Une ligne sans `dialplan_detail_tag` est **silencieusement supprimée** avant
+        écriture ; `dialplan_detail_tag` est donc requis pour chaque ligne. Les
+        lignes sont triées par `dialplan_detail_group` puis `dialplan_detail_order`
+        avant écriture : l'ordre du tableau envoyé n'a pas d'importance, celui de
+        ces deux entiers en a.
+
+        ## Garde d'exécution de commande
+
+        Les applications `system`, `bgsystem`, `spawn`, `bg_spawn` et `spawn_stream`
+        sont refusées (`400`), en mode builder comme dans le XML brut : elles
+        permettraient l'exécution de commandes arbitraires sur le PBX. En mode
+        `xml`, le XML est en outre validé syntaxiquement.
+
+        Le XML effectif n'est pas renvoyé — voir le schéma `Dialplan`.
+
+        Permission requise : `dialplan_add`.
+      parameters:
+        - $ref: '#/components/parameters/DomainUuid'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/DialplanCreateRequest'
+            examples:
+              extension_ia:
+                summary: 'Extension IA pontée vers une passerelle opérateur'
+                value:
+                  dialplan_name: callpulse_ai_9001
+                  dialplan_number: '9001'
+                  dialplan_context: client.exemple.fr
+                  dialplan_continue: false
+                  dialplan_order: 100
+                  dialplan_enabled: true
+                  dialplan_description: 'Extension IA CallPulse — poste 9001'
+                  editor_mode: builder
+                  details:
+                    - dialplan_detail_tag: condition
+                      dialplan_detail_type: destination_number
+                      dialplan_detail_data: '^9001$'
+                      dialplan_detail_group: 0
+                      dialplan_detail_order: 10
+                      dialplan_detail_enabled: true
+                    - dialplan_detail_tag: action
+                      dialplan_detail_type: export
+                      dialplan_detail_data: 'sip_h_X-CallPulse-DID=9001'
+                      dialplan_detail_group: 0
+                      dialplan_detail_order: 20
+                      dialplan_detail_enabled: true
+                    - dialplan_detail_tag: action
+                      dialplan_detail_type: bridge
+                      dialplan_detail_data: 'sofia/gateway/47aa96db-3f70-46ce-bb9a-79ccef396f2b/cp90029ad0b3ae08'
+                      dialplan_detail_group: 0
+                      dialplan_detail_order: 70
+                      dialplan_detail_enabled: true
+      responses:
+        201:
+          description: 'Plan de numérotation créé, avec ses lignes de détail.'
+          headers:
+            Location:
+              description: 'URL du plan créé.'
+              schema:
+                type: string
+                example: '/api/v1/domains/4018f7a3-8e0a-47bb-9f4f-04b1313e0e1b/dialplans/8c0f2b1d-1f2e-4a3b-9c4d-5e6f7a8b9c0d'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Dialplan'
+        400: { $ref: '#/components/responses/BadRequest' }
+        401: { $ref: '#/components/responses/Unauthorized' }
+        403: { $ref: '#/components/responses/Forbidden' }
+        404: { $ref: '#/components/responses/NotFound' }
+        429: { $ref: '#/components/responses/TooManyRequests' }
+        500: { $ref: '#/components/responses/InternalError' }
+
+  '/api/v1/domains/{domain_uuid}/dialplans/reload':
+    post:
+      tags: [Dialplans]
+      operationId: reloadDialplans
+      summary: 'Recharger le XML des plans de numérotation'
+      description: |
+        Émet `bgapi reloadxml` sur l'event socket. Aucune écriture en base.
+
+        Une réponse moteur commençant par `-ERR` — event socket injoignable
+        compris — produit un `422`. Les écritures de plan (`POST`, `PATCH`,
+        `DELETE`) déclenchent déjà un `reloadxml` : cet endpoint sert à rattraper
+        un rechargement qui a échoué, signalé par le `switch_response` d'un appel
+        précédent.
+
+        Bien que le rechargement soit `bgapi` (asynchrone côté FreeSWITCH), la
+        réponse est `200` : le code n'atteste que de la **remise** de la commande.
+
+        Sans corps de requête.
+
+        Note d'implémentation : cette route littérale doit être déclarée **avant**
+        `/domains/{domain_uuid}/dialplans/{dialplan_uuid}`.
+
+        Permission requise : `dialplan_view`.
+      parameters:
+        - $ref: '#/components/parameters/DomainUuid'
+      responses:
+        200:
+          description: 'Commande de rechargement remise au moteur.'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DialplanReloadResponse'
+        400: { $ref: '#/components/responses/BadRequest' }
+        401: { $ref: '#/components/responses/Unauthorized' }
+        403: { $ref: '#/components/responses/Forbidden' }
+        404: { $ref: '#/components/responses/NotFound' }
+        422: { $ref: '#/components/responses/SwitchError' }
+        429: { $ref: '#/components/responses/TooManyRequests' }
+        500: { $ref: '#/components/responses/InternalError' }
+
+  '/api/v1/domains/{domain_uuid}/dialplans/{dialplan_uuid}':
+    get:
+      tags: [Dialplans]
+      operationId: getDialplan
+      summary: 'Lire un plan de numérotation et ses lignes de détail'
+      description: |
+        Le plan doit appartenir au domaine de la route : un `dialplan_uuid`
+        valide mais rattaché à un autre domaine répond `404`, pas `403`.
+
+        Permission requise : `dialplan_view`.
+      parameters:
+        - $ref: '#/components/parameters/DomainUuid'
+        - $ref: '#/components/parameters/DialplanUuid'
+      responses:
+        200:
+          description: Succès.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Dialplan'
+        400: { $ref: '#/components/responses/BadRequest' }
+        401: { $ref: '#/components/responses/Unauthorized' }
+        403: { $ref: '#/components/responses/Forbidden' }
+        404: { $ref: '#/components/responses/NotFound' }
+        429: { $ref: '#/components/responses/TooManyRequests' }
+        500: { $ref: '#/components/responses/InternalError' }
+
+    patch:
+      tags: [Dialplans]
+      operationId: updateDialplan
+      summary: 'Modifier partiellement un plan de numérotation'
+      description: |
+        Le verbe est **`PATCH`**, pas `PUT` : `PUT` répond `405`.
+
+        Les attributs du plan sont partiels — seuls ceux présents sont appliqués.
+
+        ## ⚠️ `details` est un remplacement total
+
+        En mode `builder`, envoyer `details` **supprime toutes les lignes de détail
+        existantes** et réinsère exactement celles reçues, puis reconstruit le XML.
+        Il n'y a pas de modification ligne à ligne : lire le plan, modifier le
+        tableau `details` reçu, renvoyer ce tableau entier.
+
+        Omettre `details` en mode `builder` reconstruit le XML **sans aucune
+        ligne** : pour ne pas toucher aux détails, ne pas appeler `PATCH` sur ce
+        plan, ou renvoyer le tableau `details` lu au préalable.
+
+        Les mêmes gardes qu'à la création s'appliquent (applications dangereuses,
+        validation XML, exclusion `builder` / `xml`). Le cache du contexte est
+        invalidé et `bgapi reloadxml` est émis ; résultat dans `switch_response`.
+
+        Permission requise : `dialplan_edit`.
+      parameters:
+        - $ref: '#/components/parameters/DomainUuid'
+        - $ref: '#/components/parameters/DialplanUuid'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/DialplanUpdateRequest'
+            examples:
+              desactiver:
+                summary: 'Désactiver le plan sans toucher à ses lignes'
+                value:
+                  dialplan_enabled: false
+      responses:
+        200:
+          description: 'Plan modifié.'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Dialplan'
+        400: { $ref: '#/components/responses/BadRequest' }
+        401: { $ref: '#/components/responses/Unauthorized' }
+        403: { $ref: '#/components/responses/Forbidden' }
+        404: { $ref: '#/components/responses/NotFound' }
+        429: { $ref: '#/components/responses/TooManyRequests' }
+        500: { $ref: '#/components/responses/InternalError' }
+
+    delete:
+      tags: [Dialplans]
+      operationId: deleteDialplan
+      summary: 'Supprimer un plan de numérotation'
+      description: |
+        Supprime le plan **et toutes ses lignes de détail**, invalide le cache du
+        contexte, puis émet `bgapi reloadxml`.
+
+        Réponse **`204 No Content`, sans corps** : le résultat du rechargement
+        n'est donc pas observable ici. Si la prise en compte par FreeSWITCH doit
+        être vérifiée, enchaîner avec `POST /dialplans/reload`, qui répond `422`
+        quand le moteur est injoignable.
+
+        Permission requise : `dialplan_delete`.
+      parameters:
+        - $ref: '#/components/parameters/DomainUuid'
+        - $ref: '#/components/parameters/DialplanUuid'
+      responses:
+        204:
+          description: 'Plan supprimé. Aucun corps de réponse.'
+        400: { $ref: '#/components/responses/BadRequest' }
+        401: { $ref: '#/components/responses/Unauthorized' }
+        403: { $ref: '#/components/responses/Forbidden' }
+        404: { $ref: '#/components/responses/NotFound' }
+        429: { $ref: '#/components/responses/TooManyRequests' }
+        500: { $ref: '#/components/responses/InternalError' }
+
+components:
+
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      description: |
+        Jeton personnel (Sanctum) d'un utilisateur FS PBX, créé depuis le tableau
+        de bord. Un jeton par environnement appelant. L'en-tête
+        `Authorization: Bearer <token>` est obligatoire sur toutes les opérations.
+
+  parameters:
+
+    DomainUuid:
+      name: domain_uuid
+      in: path
+      required: true
+      description: |
+        UUID du domaine (tenant). Doit correspondre à `^[0-9a-fA-F-]{36}$`, sinon
+        `400`. Le domaine doit être dans le périmètre de l'utilisateur du jeton,
+        sinon `403` (`forbidden_domain`) ; s'il n'existe pas, `404`.
+      schema:
+        type: string
+        format: uuid
+      example: 4018f7a3-8e0a-47bb-9f4f-04b1313e0e1b
+
+    GatewayUuid:
+      name: gateway_uuid
+      in: path
+      required: true
+      description: |
+        UUID de la passerelle. C'est aussi son nom dans Sofia
+        (`sofia/gateway/<gateway_uuid>/...`).
+      schema:
+        type: string
+        format: uuid
+      example: 47aa96db-3f70-46ce-bb9a-79ccef396f2b
+
+    AccessControlUuid:
+      name: access_control_uuid
+      in: path
+      required: true
+      description: "UUID de la liste d'accès (globale à l'instance)."
+      schema:
+        type: string
+        format: uuid
+      example: 2b6a9f41-7c3d-4e58-9a10-3f5b8c7d6e21
+
+    DialplanUuid:
+      name: dialplan_uuid
+      in: path
+      required: true
+      description: 'UUID du plan de numérotation.'
+      schema:
+        type: string
+        format: uuid
+      example: 8c0f2b1d-1f2e-4a3b-9c4d-5e6f7a8b9c0d
+
+    Limit:
+      name: limit
+      in: query
+      required: false
+      description: "Nombre d'éléments à renvoyer. Défaut 50, borné entre 1 et 100."
+      schema:
+        type: integer
+        minimum: 1
+        maximum: 100
+        default: 50
+      example: 50
+
+  responses:
+
+    BadRequest:
+      description: |
+        UUID de route malformé, ou corps invalide. **La validation du corps est
+        rendue en `400`** (`error.code = "invalid_parameter"`, `error.param` porte
+        le premier champ fautif), jamais en `422` : dans cette API, `422` est
+        réservé aux erreurs du moteur téléphonique.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorEnvelope'
+          examples:
+            uuid_malforme:
+              value:
+                error:
+                  type: invalid_request_error
+                  message: 'Invalid domain UUID.'
+                  code: invalid_request
+                  param: domain_uuid
+                  doc_url: 'https://www.fspbx.com/docs/api/v1/errors/'
+            corps_invalide:
+              value:
+                error:
+                  type: invalid_request_error
+                  message: 'Enter a valid IP address or CIDR range.'
+                  code: invalid_parameter
+                  param: nodes.0.node_cidr
+                  doc_url: 'https://www.fspbx.com/docs/api/v1/errors/'
+
+    Unauthorized:
+      description: |
+        Jeton absent, invalide ou révoqué. **Deux formes de corps** selon la couche
+        qui refuse : le middleware `RequireBearerToken` (en-tête absent) renvoie
+        `{"success": false, "message": "Bearer token required."}`, tandis qu'un
+        jeton invalide passe par l'enveloppe d'erreur standard.
+      content:
+        application/json:
+          schema:
+            anyOf:
+              - $ref: '#/components/schemas/ErrorEnvelope'
+              - $ref: '#/components/schemas/MiddlewareError'
+          examples:
+            entete_absente:
+              summary: 'Aucun en-tête Authorization'
+              value:
+                success: false
+                message: 'Bearer token required.'
+            jeton_invalide:
+              summary: 'Jeton présent mais invalide ou révoqué'
+              value:
+                error:
+                  type: authentication_error
+                  message: Unauthenticated.
+                  code: unauthenticated
+
+    Forbidden:
+      description: |
+        Permission manquante, ou domaine hors du périmètre de l'utilisateur.
+        **Deux formes de corps** : permission manquante → forme « middleware » avec
+        `error.code = "forbidden_permission"` et `error.permission` nommant la
+        permission attendue ; domaine interdit → enveloppe standard avec
+        `error.code = "forbidden_domain"`.
+      content:
+        application/json:
+          schema:
+            anyOf:
+              - $ref: '#/components/schemas/MiddlewareError'
+              - $ref: '#/components/schemas/ErrorEnvelope'
+          examples:
+            permission_manquante:
+              value:
+                success: false
+                message: 'Forbidden (missing permission).'
+                error:
+                  code: forbidden_permission
+                  permission: gateway_add
+            domaine_interdit:
+              value:
+                error:
+                  type: invalid_request_error
+                  message: 'You do not have access to this domain.'
+                  code: forbidden_domain
+                  param: domain_uuid
+                  doc_url: 'https://www.fspbx.com/docs/api/v1/errors/'
+
+    NotFound:
+      description: |
+        Ressource inexistante, ou existante mais rattachée à un autre domaine que
+        celui de la route.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorEnvelope'
+          example:
+            error:
+              type: invalid_request_error
+              message: 'Gateway not found.'
+              code: resource_missing
+              param: gateway_uuid
+              doc_url: 'https://www.fspbx.com/docs/api/v1/errors/'
+
+    SwitchError:
+      description: |
+        **Le moteur téléphonique a répondu une erreur.** `error.message` porte la
+        réponse brute de FreeSWITCH, y compris la sentinelle
+        `-ERR Could not connect to FreeSWITCH event socket.` quand l'event socket
+        est injoignable. Aucune écriture en base n'est concernée : ces opérations
+        n'en font pas.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorEnvelope'
+          example:
+            error:
+              type: invalid_request_error
+              message: '-ERR Could not connect to FreeSWITCH event socket.'
+              code: switch_error
+              param: null
+              doc_url: 'https://www.fspbx.com/docs/api/v1/errors/'
+
+    TooManyRequests:
+      description: |
+        Débit dépassé : 60 requêtes par minute et par utilisateur authentifié
+        (à défaut, par adresse IP). Les en-têtes `Retry-After` et
+        `X-RateLimit-Remaining` accompagnent la réponse.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorEnvelope'
+
+    InternalError:
+      description: |
+        Erreur interne. Le message est volontairement générique ; le détail est
+        journalisé côté serveur.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorEnvelope'
+          example:
+            error:
+              type: api_error
+              message: 'Internal server error.'
+              code: internal_error
+              doc_url: 'https://www.fspbx.com/docs/api/v1/errors/'
+
+  schemas:
+
+    # --- Erreurs -------------------------------------------------------------
+
+    ErrorEnvelope:
+      type: object
+      description: "Enveloppe d'erreur standard de l'API v1."
+      required: [error]
+      properties:
+        error:
+          type: object
+          required: [type, message]
+          properties:
+            type:
+              type: string
+              description: "Famille d'erreur."
+              enum:
+                - invalid_request_error
+                - authentication_error
+                - not_found
+                - forbidden_method
+                - api_error
+            message:
+              type: string
+              description: "Message lisible. Pour un `422`, il contient la réponse brute du moteur téléphonique."
+            code:
+              type: string
+              nullable: true
+              description: 'Code machine, stable — c''est lui qu''un client doit tester.'
+              enum:
+                - unauthenticated
+                - invalid_request
+                - invalid_parameter
+                - forbidden
+                - forbidden_domain
+                - forbidden_permission
+                - resource_missing
+                - resource_not_found
+                - switch_error
+                - internal_error
+            param:
+              type: string
+              nullable: true
+              description: 'Champ ou paramètre fautif, quand il est identifiable.'
+            doc_url:
+              type: string
+              nullable: true
+
+    MiddlewareError:
+      type: object
+      description: |
+        Forme d'erreur renvoyée par les middlewares d'authentification et
+        d'autorisation, **distincte** de l'enveloppe standard.
+      required: [success, message]
+      properties:
+        success:
+          type: boolean
+          enum: [false]
+        message:
+          type: string
+          example: 'Forbidden (missing permission).'
+        error:
+          type: object
+          nullable: true
+          properties:
+            code:
+              type: string
+              enum: [forbidden_permission]
+            permission:
+              type: string
+              description: 'Permission attendue.'
+              example: gateway_add
+
+    # --- Passerelles ---------------------------------------------------------
+
+    GatewayState:
+      type: string
+      description: |
+        État de la passerelle tel que rapporté par le moteur téléphonique.
+
+        **L'énumération est fermée** : tout autre état renvoyé par FreeSWITCH
+        (`TRYING`, `REG_FAILED`, …) est ramené à `UNKNOWN`. Un client peut donc
+        traiter cette valeur comme un ensemble fini.
+
+        - `REGED` — enregistrée auprès du proxy distant ;
+        - `UNREGED` — désenregistrée ;
+        - `NOREG` — passerelle configurée sans enregistrement (`register = false`) ;
+        - `FAIL_WAIT` — échec d'enregistrement, attente avant nouvelle tentative ;
+        - `DOWN` — passerelle arrêtée sur le moteur ;
+        - `UNKNOWN` — état indéterminé, **notamment quand l'event socket est
+          injoignable** : ce n'est pas un état de la passerelle mais une absence
+          d'information.
+      enum: [REGED, NOREG, FAIL_WAIT, DOWN, UNREGED, UNKNOWN]
+      example: REGED
+
+    GatewayCommon:
+      type: object
+      description: 'Champs de configuration communs à la création et à la modification.'
+      properties:
+        gateway:
+          type: string
+          maxLength: 255
+          description: 'Nom logique de la passerelle. N''est pas son identifiant Sofia : Sofia la nomme par son `gateway_uuid`.'
+          example: client_poste_250
+        proxy:
+          type: string
+          maxLength: 255
+          description: 'Proxy SIP distant, `hôte` ou `hôte:port`.'
+          example: 'sip.exemple-operateur.fr:5060'
+        register:
+          type: boolean
+          description: 'La passerelle s''enregistre-t-elle auprès du proxy ? Si `true`, `username` et `password` sont requis.'
+        username:
+          type: string
+          nullable: true
+          maxLength: 255
+          description: "Identifiant SIP. Requis si `register` vaut `true`."
+        password:
+          type: string
+          nullable: true
+          maxLength: 255
+          format: password
+          writeOnly: true
+          description: |
+            **Écriture seule.** Requis si `register` vaut `true`.
+            Ce champ n'apparaît dans **aucune** réponse de cette API.
+        auth_username:
+          type: string
+          nullable: true
+          maxLength: 255
+          description: "Identifiant d'authentification, s'il diffère de `username`."
+        realm:
+          type: string
+          nullable: true
+          maxLength: 255
+        from_user:
+          type: string
+          nullable: true
+          maxLength: 255
+        from_domain:
+          type: string
+          nullable: true
+          maxLength: 255
+        register_proxy:
+          type: string
+          nullable: true
+          maxLength: 255
+        outbound_proxy:
+          type: string
+          nullable: true
+          maxLength: 255
+        register_transport:
+          type: string
+          nullable: true
+          description: |
+            Transport SIP utilisé pour l'enregistrement. **C'est le seul champ de
+            transport de `v_gateways`** : il n'existe pas de champ `transport`.
+          enum: [udp, tcp, tls]
+          example: udp
+        expire_seconds:
+          type: integer
+          minimum: 1
+          maximum: 65535
+          default: 800
+          description: "Durée d'enregistrement demandée, en secondes."
+        retry_seconds:
+          type: integer
+          minimum: 1
+          maximum: 65535
+          default: 30
+          description: 'Délai avant nouvelle tentative après un échec.'
+        contact_params:
+          type: string
+          nullable: true
+          maxLength: 255
+        extension:
+          type: string
+          nullable: true
+          maxLength: 255
+        ping:
+          type: integer
+          nullable: true
+          minimum: 1
+          maximum: 65535
+          description: 'Période de sonde SIP OPTIONS, en secondes. Conditionne `ping_state` et `ping_time_ms` en lecture.'
+        ping_min:
+          type: integer
+          nullable: true
+          minimum: 1
+          maximum: 65535
+        ping_max:
+          type: integer
+          nullable: true
+          minimum: 1
+          maximum: 65535
+        contact_in_ping:
+          type: boolean
+          nullable: true
+        channels:
+          type: integer
+          nullable: true
+          minimum: 0
+          maximum: 65535
+          description: 'Nombre de canaux simultanés autorisés. `0` = non limité par ce champ.'
+        caller_id_in_from:
+          type: boolean
+          nullable: true
+        supress_cng:
+          type: boolean
+          nullable: true
+          description: "Orthographe de la colonne FusionPBX (`supress`, avec un seul « p ») — conservée telle quelle."
+        sip_cid_type:
+          type: string
+          nullable: true
+          enum: [none, pid, rpid]
+        codec_prefs:
+          type: string
+          nullable: true
+          maxLength: 255
+          example: 'PCMA,PCMU,OPUS'
+        extension_in_contact:
+          type: boolean
+          nullable: true
+        distinct_to:
+          type: boolean
+          nullable: true
+        context:
+          type: string
+          maxLength: 255
+          default: public
+          description: 'Contexte de dialplan dans lequel arrivent les appels entrants de cette passerelle.'
+        profile:
+          type: string
+          maxLength: 255
+          default: external
+          description: "Profil Sofia portant la passerelle. `external` dans le cas courant. Changer ce champ rescanne l'ancien **et** le nouveau profil."
+        hostname:
+          type: string
+          nullable: true
+          maxLength: 255
+          description: "Restreint la passerelle à un nœud FreeSWITCH donné. `null` = tous les nœuds."
+        enabled:
+          type: boolean
+          description: 'Passerelle active. À `false`, aucune commande de démarrage n''est émise et `switch_response` vaut `Skipped: gateway is disabled.`.'
+        description:
+          type: string
+          nullable: true
+          maxLength: 255
+        gateway_acl_cidrs:
+          type: array
+          nullable: true
+          description: |
+            Liste blanche d'IP du fournisseur, en notation CIDR. Alimente une liste
+            d'accès dédiée (`<nom de la passerelle> Provider IPs`, défaut `deny`) et
+            des nœuds miroirs dans la liste globale `providers`.
+
+            **Remplacement total** : la liste envoyée remplace la précédente ; un
+            tableau vide supprime les listes gérées de cette passerelle.
+
+            Renseigner ces IP **avant** le premier REGISTER : sans elles, le
+            pare-feu bloque le fournisseur silencieusement.
+          items:
+            type: string
+            description: 'Adresse IPv4/IPv6 ou plage CIDR. Une IPv4 sans préfixe est normalisée en `/32`.'
+            example: 192.0.2.10/32
+
+    GatewayCreateRequest:
+      allOf:
+        - $ref: '#/components/schemas/GatewayCommon'
+        - type: object
+          required: [gateway, proxy, register, profile, enabled]
+          description: |
+            `domain_uuid` n'est pas accepté dans le corps : le rattachement vient
+            exclusivement du `{domain_uuid}` de la route.
+
+    GatewayUpdateRequest:
+      allOf:
+        - $ref: '#/components/schemas/GatewayCommon'
+        - type: object
+          description: |
+            Modification partielle : aucun champ n'est requis, seuls les champs
+            présents sont appliqués.
+
+    Gateway:
+      type: object
+      description: |
+        Représentation d'une passerelle en réponse.
+
+        **Le mot de passe SIP (`password`) n'est jamais renvoyé, sur aucune
+        opération** — ni à la création, ni en lecture, ni après modification. Il
+        s'écrit et ne se relit pas. Un client qui a besoin de le vérifier doit le
+        réécrire, pas le lire.
+      required: [gateway_uuid, object, domain_uuid, gateway, state]
+      properties:
+        gateway_uuid:
+          type: string
+          format: uuid
+          description: 'Identifiant de la passerelle, et son nom dans Sofia.'
+          example: 47aa96db-3f70-46ce-bb9a-79ccef396f2b
+        object:
+          type: string
+          enum: [gateway]
+        domain_uuid:
+          type: string
+          format: uuid
+        gateway:
+          type: string
+          example: client_poste_250
+        username:
+          type: string
+          nullable: true
+        proxy:
+          type: string
+          nullable: true
+        register:
+          type: boolean
+        register_transport:
+          type: string
+          nullable: true
+          enum: [udp, tcp, tls]
+        from_user:
+          type: string
+          nullable: true
+        from_domain:
+          type: string
+          nullable: true
+        expire_seconds:
+          type: integer
+          nullable: true
+        retry_seconds:
+          type: integer
+          nullable: true
+        ping:
+          type: integer
+          nullable: true
+        channels:
+          type: integer
+          nullable: true
+        context:
+          type: string
+          nullable: true
+        profile:
+          type: string
+          nullable: true
+          example: external
+        hostname:
+          type: string
+          nullable: true
+        enabled:
+          type: boolean
+        description:
+          type: string
+          nullable: true
+        state:
+          $ref: '#/components/schemas/GatewayState'
+        ping_state:
+          type: string
+          nullable: true
+          description: |
+            État de la sonde SIP OPTIONS, tel que rapporté par le moteur.
+            `null` si `ping` n'est pas configuré sur la passerelle, ou si le
+            moteur est injoignable.
+          example: UP
+        ping_time_ms:
+          type: number
+          nullable: true
+          description: 'Temps de sonde en millisecondes. `null` si indisponible.'
+          example: 12.4
+        switch_response:
+          type: string
+          nullable: true
+          description: |
+            Réponse brute du moteur à la commande de démarrage. **Une valeur
+            commençant par `-ERR` signifie que la base est à jour mais que
+            FreeSWITCH n'a pas pris la passerelle en compte.**
+          example: '+OK'
+        acl_response:
+          type: string
+          nullable: true
+          description: 'Réponse brute du moteur au rechargement des listes d''accès (`reloadacl`). Mêmes règles de lecture que `switch_response`.'
+
+    GatewayRestartAccepted:
+      type: object
+      required: [object, gateway_uuid, switch_response]
+      properties:
+        object:
+          type: string
+          enum: [gateway]
+        gateway_uuid:
+          type: string
+          format: uuid
+        switch_response:
+          type: string
+          description: |
+            Réponse brute du moteur. `Skipped: gateway is disabled.` quand la
+            passerelle est désactivée : la commande n'a pas été émise, et c'est
+            un `202`, pas une erreur.
+          example: '+OK'
+
+    # --- Listes d'accès ------------------------------------------------------
+
+    AccessControlNode:
+      type: object
+      description: 'Une entrée de liste d''accès.'
+      required: [node_cidr]
+      properties:
+        node_type:
+          type: string
+          enum: [allow, deny]
+          default: allow
+          description: 'Toute valeur autre que `allow` ou `deny` est ramenée à `allow`.'
+        node_cidr:
+          type: string
+          maxLength: 255
+          description: |
+            Adresse ou plage, en notation CIDR. Une IPv4 sans préfixe est
+            normalisée en `/32`, une IPv6 sans préfixe est conservée nue.
+
+            Un CIDR que le service ne sait pas normaliser serait **ignoré
+            silencieusement** : il est donc refusé en amont (`400`). Sont
+            également refusés `0.0.0.0/0`, les plages privées ou réservées
+            (`10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`, `127.0.0.0/8`,
+            `100.64.0.0/10`) et tout masque plus large que `/24` sur une liste
+            dont le défaut est `deny`.
+          example: 192.0.2.10/32
+        node_description:
+          type: string
+          nullable: true
+          maxLength: 255
+          example: 'Opérateur — SBC 1'
+
+    AccessControlSummary:
+      type: object
+      description: "Liste d'accès sans ses nœuds."
+      required: [access_control_uuid, object, access_control_name, access_control_default]
+      properties:
+        access_control_uuid:
+          type: string
+          format: uuid
+          example: 2b6a9f41-7c3d-4e58-9a10-3f5b8c7d6e21
+        object:
+          type: string
+          enum: [access_control]
+        access_control_name:
+          type: string
+          maxLength: 255
+          example: providers
+        access_control_default:
+          type: string
+          enum: [allow, deny]
+          description: 'Politique appliquée à ce qui n''est couvert par aucun nœud.'
+        access_control_description:
+          type: string
+          nullable: true
+          maxLength: 255
+
+    AccessControl:
+      allOf:
+        - $ref: '#/components/schemas/AccessControlSummary'
+        - type: object
+          required: [nodes]
+          properties:
+            nodes:
+              type: array
+              description: "**Intégralité** des nœuds de la liste. C'est ce tableau, modifié, qu'un `PATCH` doit renvoyer."
+              items:
+                $ref: '#/components/schemas/AccessControlNode'
+            switch_response:
+              type: string
+              nullable: true
+              description: |
+                Présent après un `PATCH` : réponse brute du moteur à `reloadacl`.
+                Une valeur commençant par `-ERR` signifie que la base est à jour
+                mais que FreeSWITCH applique encore l'ancienne liste. Absent (ou
+                `null`) en lecture.
+
+    AccessControlUpdateRequest:
+      type: object
+      description: |
+        `nodes` est un **remplacement total** (voir la description de l'opération).
+        Les trois autres champs sont facultatifs et conservent leur valeur courante
+        s'ils sont omis.
+      properties:
+        access_control_name:
+          type: string
+          maxLength: 255
+        access_control_default:
+          type: string
+          enum: [allow, deny]
+          description: |
+            Omis, ce champ conserve sa valeur courante. Le passer de `deny` à
+            `allow` ouvre la liste à tout ce qu'aucun nœud ne couvre : à envoyer
+            délibérément.
+        access_control_description:
+          type: string
+          nullable: true
+          maxLength: 255
+        nodes:
+          type: array
+          description: |
+            **Liste complète et définitive des nœuds.** Tout nœud absent de ce
+            tableau est supprimé. `[]` vide la liste.
+          items:
+            $ref: '#/components/schemas/AccessControlNode'
+
+    AccessControlListResponse:
+      type: object
+      description: "Enveloppe de liste de l'API v1."
+      required: [object, url, has_more, data]
+      properties:
+        object:
+          type: string
+          enum: [list]
+        url:
+          type: string
+          example: /api/v1/access-controls
+        has_more:
+          type: boolean
+          description: 'Toujours `false` : cette collection n''est pas paginée.'
+        data:
+          type: array
+          items:
+            $ref: '#/components/schemas/AccessControlSummary'
+
+    AccessControlReloadResponse:
+      type: object
+      required: [object, switch_response]
+      properties:
+        object:
+          type: string
+          enum: [access_control_reload]
+        switch_response:
+          type: string
+          description: 'Réponse brute du moteur à `reloadacl`. Une réponse `-ERR` produit un `422`, elle n''apparaît donc jamais ici.'
+          example: '+OK'
+
+    # --- Plans de numérotation -----------------------------------------------
+
+    DialplanDetail:
+      type: object
+      description: |
+        Une ligne du plan. L'ordre d'écriture est donné par
+        `dialplan_detail_group` puis `dialplan_detail_order`, pas par la position
+        dans le tableau.
+      required: [dialplan_detail_tag]
+      properties:
+        dialplan_detail_uuid:
+          type: string
+          format: uuid
+          nullable: true
+          description: 'Présent en lecture. En écriture, il est ignoré : les lignes sont recréées à chaque enregistrement.'
+        dialplan_detail_tag:
+          type: string
+          enum: [condition, regex, action, anti-action]
+          description: |
+            **Requis.** Une ligne sans `dialplan_detail_tag` est silencieusement
+            supprimée avant écriture.
+        dialplan_detail_type:
+          type: string
+          nullable: true
+          maxLength: 255
+          description: |
+            Pour une `condition` : le champ testé (`destination_number`,
+            `caller_id_number`, `${...}`…). Pour une `action` ou une
+            `anti-action` : l'application FreeSWITCH (`set`, `export`, `bridge`…).
+
+            Les applications `system`, `bgsystem`, `spawn`, `bg_spawn` et
+            `spawn_stream` sont refusées (`400`).
+          example: bridge
+        dialplan_detail_data:
+          type: string
+          nullable: true
+          maxLength: 4096
+          description: "Expression régulière d'une condition, ou argument de l'application."
+          example: 'sofia/gateway/47aa96db-3f70-46ce-bb9a-79ccef396f2b/cp90029ad0b3ae08'
+        dialplan_detail_break:
+          type: string
+          nullable: true
+          enum: [on-true, on-false, always, never]
+          description: 'Comportement de rupture de la condition.'
+        dialplan_detail_inline:
+          type: boolean
+          nullable: true
+        dialplan_detail_group:
+          type: integer
+          minimum: 0
+          maximum: 999
+          default: 0
+          description: 'Groupe de condition. Les lignes sont triées par ce champ en premier.'
+        dialplan_detail_order:
+          type: integer
+          minimum: 0
+          maximum: 9999
+          default: 0
+          description: 'Rang dans le groupe.'
+        dialplan_detail_enabled:
+          type: boolean
+          default: true
+
+    DialplanCommon:
+      type: object
+      properties:
+        dialplan_name:
+          type: string
+          maxLength: 255
+          description: 'Nom du plan. Il est assaini avant écriture : la valeur enregistrée peut différer de celle envoyée — la relire dans la réponse.'
+          example: callpulse_ai_9001
+        dialplan_number:
+          type: string
+          nullable: true
+          maxLength: 255
+        dialplan_destination:
+          type: boolean
+          nullable: true
+          description: 'Le plan apparaît-il comme destination sélectionnable dans l''interface ?'
+        dialplan_context:
+          type: string
+          maxLength: 255
+          description: 'Contexte FreeSWITCH. Généralement le nom du domaine du tenant, ou `public` pour les appels entrants.'
+          example: client.exemple.fr
+        dialplan_continue:
+          type: boolean
+          description: 'Poursuivre le traitement des plans suivants après celui-ci.'
+        dialplan_order:
+          type: integer
+          minimum: 0
+          maximum: 999
+          description: "Rang d'évaluation dans le contexte. Plus petit = évalué plus tôt."
+          example: 100
+        dialplan_enabled:
+          type: boolean
+        dialplan_description:
+          type: string
+          nullable: true
+          maxLength: 255
+        hostname:
+          type: string
+          nullable: true
+          maxLength: 255
+          description: "Restreint le plan à un nœud FreeSWITCH donné. `null` = tous les nœuds."
+        editor_mode:
+          type: string
+          enum: [builder, xml]
+          default: builder
+          description: |
+            - `builder` — le XML est **construit à partir de `details`** ; un
+              `dialplan_xml` envoyé est ignoré.
+            - `xml` — le `dialplan_xml` fourni est enregistré tel quel et
+              **`details` est ignoré** : aucune ligne de détail n'est créée.
+        dialplan_xml:
+          type: string
+          nullable: true
+          description: |
+            XML FreeSWITCH brut. **Pris en compte uniquement si
+            `editor_mode` vaut `xml`.** Il est alors validé syntaxiquement et
+            inspecté : la présence d'une application dangereuse (`system`,
+            `bgsystem`, `spawn`, `bg_spawn`, `spawn_stream`) produit un `400`.
+        details:
+          type: array
+          description: |
+            Lignes du plan. **Remplacement total** en mode `builder` : les lignes
+            existantes sont supprimées et remplacées par celles reçues.
+            Ignoré en mode `xml`.
+          items:
+            $ref: '#/components/schemas/DialplanDetail'
+
+    DialplanCreateRequest:
+      allOf:
+        - $ref: '#/components/schemas/DialplanCommon'
+        - type: object
+          required: [dialplan_name, dialplan_context, dialplan_continue, dialplan_order, dialplan_enabled]
+          description: |
+            `domain_uuid` n'est pas accepté dans le corps : le rattachement vient
+            exclusivement du `{domain_uuid}` de la route.
+
+            En mode `builder` (défaut), `details` doit contenir au moins une ligne.
+            En mode `xml`, `dialplan_xml` est requis.
+
+    DialplanUpdateRequest:
+      allOf:
+        - $ref: '#/components/schemas/DialplanCommon'
+        - type: object
+          description: |
+            Modification partielle : aucun champ n'est requis. Attention, `details`
+            reste un remplacement total, et l'omettre en mode `builder` reconstruit
+            le plan sans aucune ligne.
+
+    Dialplan:
+      type: object
+      description: |
+        Représentation d'un plan de numérotation en réponse.
+
+        Le XML effectif (`v_dialplans.dialplan_xml`) **n'est pas renvoyé** : en
+        mode `builder` il est reconstruit à partir de `details`, qui est la source
+        de vérité exposée par cette API.
+      required: [dialplan_uuid, object, domain_uuid, dialplan_name, dialplan_context]
+      properties:
+        dialplan_uuid:
+          type: string
+          format: uuid
+          example: 8c0f2b1d-1f2e-4a3b-9c4d-5e6f7a8b9c0d
+        object:
+          type: string
+          enum: [dialplan]
+        domain_uuid:
+          type: string
+          format: uuid
+        dialplan_name:
+          type: string
+          description: 'Nom réellement enregistré, après assainissement.'
+        dialplan_number:
+          type: string
+          nullable: true
+        dialplan_context:
+          type: string
+        dialplan_order:
+          type: integer
+        dialplan_enabled:
+          type: boolean
+        dialplan_continue:
+          type: boolean
+        dialplan_destination:
+          type: boolean
+          nullable: true
+        dialplan_description:
+          type: string
+          nullable: true
+        details:
+          type: array
+          description: 'Lignes du plan, triées par `dialplan_detail_group` puis `dialplan_detail_order`. Vide si le plan a été enregistré en mode `xml`.'
+          items:
+            $ref: '#/components/schemas/DialplanDetail'
+        switch_response:
+          type: string
+          nullable: true
+          description: |
+            Réponse brute du moteur à `bgapi reloadxml`, présente après une
+            écriture. Une valeur commençant par `-ERR` signifie que la base est à
+            jour mais que FreeSWITCH sert encore l'ancien plan. Absent (ou `null`)
+            en lecture.
+
+    DialplanSummary:
+      type: object
+      description: 'Plan de numérotation sans ses lignes de détail, tel qu''il apparaît en liste.'
+      required: [dialplan_uuid, object, domain_uuid, dialplan_name, dialplan_context]
+      properties:
+        dialplan_uuid:
+          type: string
+          format: uuid
+        object:
+          type: string
+          enum: [dialplan]
+        domain_uuid:
+          type: string
+          format: uuid
+        dialplan_name:
+          type: string
+        dialplan_number:
+          type: string
+          nullable: true
+        dialplan_context:
+          type: string
+        dialplan_order:
+          type: integer
+        dialplan_enabled:
+          type: boolean
+        dialplan_continue:
+          type: boolean
+        dialplan_description:
+          type: string
+          nullable: true
+
+    DialplanListResponse:
+      type: object
+      description: "Enveloppe de liste de l'API v1, pagination par curseur."
+      required: [object, url, has_more, data]
+      properties:
+        object:
+          type: string
+          enum: [list]
+        url:
+          type: string
+          example: /api/v1/domains/4018f7a3-8e0a-47bb-9f4f-04b1313e0e1b/dialplans
+        has_more:
+          type: boolean
+          description: "S'il vaut `true`, rappeler l'endpoint avec `starting_after` positionné sur le `dialplan_uuid` du dernier élément reçu."
+        data:
+          type: array
+          items:
+            $ref: '#/components/schemas/DialplanSummary'
+
+    DialplanReloadResponse:
+      type: object
+      required: [object, switch_response]
+      properties:
+        object:
+          type: string
+          enum: [dialplan_reload]
+        switch_response:
+          type: string
+          description: 'Réponse brute du moteur à `bgapi reloadxml`. Une réponse `-ERR` produit un `422`, elle n''apparaît donc jamais ici.'
+          example: '+OK Job-UUID: 4f2c...'
