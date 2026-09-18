@@ -2,6 +2,7 @@
 
 namespace App\Http\Requests\Api\V1;
 
+use App\Models\Domain;
 use App\Services\DialplanService;
 use Illuminate\Contracts\Validation\Validator;
 use Illuminate\Foundation\Http\FormRequest;
@@ -101,27 +102,45 @@ class StoreDialplanRequest extends FormRequest
                 }
             }
 
-            if ($this->isXmlMode()) {
-                // The service ignores the lines in this mode; judging them would
+            if (! $this->isXmlMode()) {
+                // The service ignores the lines in xml mode; judging them would
                 // refuse a payload on a field that is never written.
-                return;
+                foreach ($this->detailLines() as $index => $detail) {
+                    $tag = $detail['dialplan_detail_tag'] ?? null;
+
+                    if (! in_array($tag, self::ACTION_TAGS, true)) {
+                        continue;
+                    }
+
+                    // Both the application and its argument are inspected: `set` with
+                    // `execute_on_answer=system …` is as dangerous as `system` itself.
+                    if ($service->containsDangerousApplication(self::asText($detail['dialplan_detail_type'] ?? null))
+                        || $service->containsDangerousApplication(self::asText($detail['dialplan_detail_data'] ?? null))) {
+                        $validator->errors()->add(
+                            "details.{$index}.dialplan_detail_type",
+                            'This FreeSWITCH application is not allowed.'
+                        );
+                    }
+                }
             }
 
-            foreach ($this->detailLines() as $index => $detail) {
-                $tag = $detail['dialplan_detail_tag'] ?? null;
+            // A dialplan context is the namespace a call is routed in: writing
+            // `public` or another tenant's context is call interception. The
+            // context must be the domain name of the tenant in the route —
+            // the value the rest of the codebase writes (session('domain_name')).
+            // Judged last and only when nothing else already refuses the
+            // request: resolving the tenant needs the database, and a request
+            // already refused needs no lookup.
+            if ($validator->errors()->isEmpty()) {
+                $context = $this->input('dialplan_context');
+                $domainName = is_string($context) ? $this->routeDomainName() : null;
 
-                if (! in_array($tag, self::ACTION_TAGS, true)) {
-                    continue;
-                }
+                if (is_string($context) && $domainName !== null) {
+                    $reason = self::contextRejectionReason($context, $domainName);
 
-                // Both the application and its argument are inspected: `set` with
-                // `execute_on_answer=system …` is as dangerous as `system` itself.
-                if ($service->containsDangerousApplication(self::asText($detail['dialplan_detail_type'] ?? null))
-                    || $service->containsDangerousApplication(self::asText($detail['dialplan_detail_data'] ?? null))) {
-                    $validator->errors()->add(
-                        "details.{$index}.dialplan_detail_type",
-                        'This FreeSWITCH application is not allowed.'
-                    );
+                    if ($reason !== null) {
+                        $validator->errors()->add('dialplan_context', $reason);
+                    }
                 }
             }
         });
@@ -194,6 +213,38 @@ class StoreDialplanRequest extends FormRequest
         }
 
         return array_filter($details, 'is_array');
+    }
+
+    /**
+     * The context rule, as a pure function so it can be exercised without an
+     * HTTP request or a database. Anything but the tenant's own domain name is
+     * refused: `public`, another domain, and the shared `global` /
+     * `${domain_name}` contexts alike.
+     */
+    public static function contextRejectionReason(string $context, string $domainName): ?string
+    {
+        if ($context !== $domainName) {
+            return 'The context must be the domain name of the tenant in the route ('
+                . $domainName . '): public, shared and foreign contexts are refused.';
+        }
+
+        return null;
+    }
+
+    /**
+     * Null when the tenant cannot be resolved: the request was built without a
+     * route (unit test), or the domain does not exist — in which case the
+     * controller answers 404 before any write anyway.
+     */
+    private function routeDomainName(): ?string
+    {
+        $domainUuid = $this->route('domain_uuid');
+
+        if (! is_string($domainUuid)) {
+            return null;
+        }
+
+        return Domain::query()->where('domain_uuid', $domainUuid)->value('domain_name');
     }
 
     private static function asText(mixed $value): ?string

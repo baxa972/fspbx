@@ -411,6 +411,37 @@ class DialplanApiTest extends TestCase
     }
 
     /**
+     * Writing into public or another tenant's context is call interception:
+     * the context must be the domain name of the route tenant.
+     */
+    public function test_create_refuses_a_context_that_is_not_the_tenant_domain(): void
+    {
+        $this->skipWithoutDatabase();
+
+        $this->actingAsApiUser();
+
+        $payload = $this->validCreatePayload();
+        $payload['dialplan_context'] = 'public';
+
+        $this->postJson($this->collectionEndpoint(), $payload)
+            ->assertStatus(400)
+            ->assertJsonPath('error.code', 'invalid_parameter')
+            ->assertJsonPath('error.param', 'dialplan_context');
+    }
+
+    public function test_update_refuses_a_context_that_is_not_the_tenant_domain(): void
+    {
+        $this->skipWithoutDatabase();
+
+        $this->actingAsApiUser();
+
+        $this->patchJson($this->itemEndpoint(), ['dialplan_context' => 'autre-client.fr'])
+            ->assertStatus(400)
+            ->assertJsonPath('error.code', 'invalid_parameter')
+            ->assertJsonPath('error.param', 'dialplan_context');
+    }
+
+    /**
      * The trap of this endpoint: DialplanService::save() reads
      * `$validated['dialplan_details'] ?? []`, so a PATCH that does not mention
      * the lines would rebuild the plan with NONE. The controller resends the

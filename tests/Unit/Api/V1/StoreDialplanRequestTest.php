@@ -449,6 +449,43 @@ class StoreDialplanRequestTest extends TestCase
     }
 
     // -----------------------------------------------------------------------
+    // The context is the tenant's, and only the tenant's
+    // -----------------------------------------------------------------------
+
+    public function test_the_tenant_own_domain_name_is_accepted_as_context(): void
+    {
+        $this->assertNull(StoreDialplanRequest::contextRejectionReason('client.exemple.fr', 'client.exemple.fr'));
+    }
+
+    /**
+     * A dialplan written into the public context intercepts inbound calls of
+     * every tenant.
+     */
+    public function test_the_public_context_is_refused(): void
+    {
+        $this->assertNotNull(StoreDialplanRequest::contextRejectionReason('public', 'client.exemple.fr'));
+    }
+
+    /**
+     * The context of another domain routes that domain's calls: writing it
+     * from this tenant is interception.
+     */
+    public function test_another_tenant_context_is_refused(): void
+    {
+        $this->assertNotNull(StoreDialplanRequest::contextRejectionReason('autre-client.fr', 'client.exemple.fr'));
+    }
+
+    /**
+     * The shared contexts are not the tenant's domain name, so they are
+     * refused by the same rule — no special case.
+     */
+    public function test_the_shared_contexts_are_refused(): void
+    {
+        $this->assertNotNull(StoreDialplanRequest::contextRejectionReason('global', 'client.exemple.fr'));
+        $this->assertNotNull(StoreDialplanRequest::contextRejectionReason('${domain_name}', 'client.exemple.fr'));
+    }
+
+    // -----------------------------------------------------------------------
     // Translation of the validated body into what the service reads
     // -----------------------------------------------------------------------
 
