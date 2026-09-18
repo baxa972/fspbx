@@ -18,9 +18,11 @@ use Illuminate\Validation\Rule;
  *    plan, which routes nothing and is only noticed when a call fails. Every line
  *    is validated here, before the service ever sees it.
  *
- *  - The FreeSWITCH applications `system`, `bgsystem`, `spawn`, `bg_spawn` and
- *    `spawn_stream` execute a shell command on the PBX. They are refused in the
- *    builder lines and in the raw XML alike.
+ *  - The FreeSWITCH applications `system`, `bgsystem`, `spawn`, `bg_spawn`,
+ *    `spawn_stream`, `lua` and `eval` execute a command or arbitrary code on
+ *    the PBX. They are refused in the builder lines and in the raw XML alike —
+ *    in the application itself and in its argument (`execute_on_answer=…`,
+ *    `api_on_…=…`).
  *
  * The contract names the lines `details`; DialplanService reads them under the
  * key `dialplan_details`. The rename happens in

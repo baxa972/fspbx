@@ -183,6 +183,16 @@ class StoreDialplanRequestTest extends TestCase
         $this->assertApplicationRefused('spawn_stream');
     }
 
+    public function test_the_lua_application_is_refused(): void
+    {
+        $this->assertApplicationRefused('lua');
+    }
+
+    public function test_the_eval_application_is_refused(): void
+    {
+        $this->assertApplicationRefused('eval');
+    }
+
     /**
      * The argument is inspected as well as the application: `set` with
      * `execute_on_answer=system …` runs the same shell command.
@@ -194,6 +204,24 @@ class StoreDialplanRequestTest extends TestCase
             'dialplan_detail_tag' => 'action',
             'dialplan_detail_type' => 'set',
             'dialplan_detail_data' => 'execute_on_answer=system rm -rf /',
+            'dialplan_detail_group' => 0,
+            'dialplan_detail_order' => 20,
+        ];
+
+        $this->assertArrayHasKey('details.1.dialplan_detail_type', $this->validateStore($payload)->errors()->toArray());
+    }
+
+    /**
+     * Same guard for the other code-execution directives: api_on_* pointing at
+     * lua runs a script with the full switch API.
+     */
+    public function test_a_lua_call_hidden_in_an_api_on_directive_is_refused(): void
+    {
+        $payload = $this->validCreatePayload();
+        $payload['details'][1] = [
+            'dialplan_detail_tag' => 'action',
+            'dialplan_detail_type' => 'set',
+            'dialplan_detail_data' => 'api_on_answer=lua /tmp/payload.lua',
             'dialplan_detail_group' => 0,
             'dialplan_detail_order' => 20,
         ];
@@ -277,6 +305,51 @@ class StoreDialplanRequestTest extends TestCase
             . '</condition></extension>';
 
         $this->assertArrayHasKey('dialplan_xml', $this->validateStore($payload)->errors()->toArray());
+    }
+
+    public function test_an_xml_carrying_a_lua_application_is_refused(): void
+    {
+        $payload = $this->validXmlPayload();
+        $payload['dialplan_xml'] = '<extension name="x"><condition field="destination_number" expression="^9001$">'
+            . '<action application="lua" data="/tmp/payload.lua"/>'
+            . '</condition></extension>';
+
+        $this->assertArrayHasKey('dialplan_xml', $this->validateStore($payload)->errors()->toArray());
+    }
+
+    public function test_an_xml_carrying_an_eval_application_is_refused(): void
+    {
+        $payload = $this->validXmlPayload();
+        $payload['dialplan_xml'] = '<extension name="x"><condition field="destination_number" expression="^9001$">'
+            . '<action application="eval" data="${lua(/tmp/payload.lua)}"/>'
+            . '</condition></extension>';
+
+        $this->assertArrayHasKey('dialplan_xml', $this->validateStore($payload)->errors()->toArray());
+    }
+
+    /**
+     * The data attribute is judged like the application: a harmless `set`
+     * whose argument schedules `system` on answer is the same shell command.
+     */
+    public function test_an_xml_hiding_a_command_in_a_data_attribute_is_refused(): void
+    {
+        $payload = $this->validXmlPayload();
+        $payload['dialplan_xml'] = '<extension name="x"><condition field="destination_number" expression="^9001$">'
+            . '<action application="set" data="execute_on_answer=system id"/>'
+            . '</condition></extension>';
+
+        $this->assertArrayHasKey('dialplan_xml', $this->validateStore($payload)->errors()->toArray());
+    }
+
+    /**
+     * The well-formed extension of the contract carries a bridge to a gateway:
+     * no execution keyword anywhere, it must keep passing.
+     */
+    public function test_an_xml_without_any_execution_keyword_still_passes(): void
+    {
+        $validator = $this->validateStore($this->validXmlPayload());
+
+        $this->assertFalse($validator->fails(), json_encode($validator->errors()->toArray()));
     }
 
     /**

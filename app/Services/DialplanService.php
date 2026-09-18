@@ -27,12 +27,19 @@ class DialplanService
         'date-time',
     ];
 
+    /**
+     * Applications that execute a command or arbitrary code on the PBX.
+     * system/spawn run a shell command; lua and eval run scripts and
+     * expressions with the full switch API at hand.
+     */
     private const DANGEROUS_APPLICATIONS = [
         'system',
         'bgsystem',
         'spawn',
         'bg_spawn',
         'spawn_stream',
+        'lua',
+        'eval',
     ];
 
     public function save(array $validated, ?Dialplans $dialplan = null): Dialplans
@@ -302,7 +309,12 @@ class DialplanService
 
         foreach (['action', 'anti-action'] as $tagName) {
             foreach ($document->getElementsByTagName($tagName) as $node) {
-                if ($this->containsDangerousApplication($node->getAttribute('application'))) {
+                // The application AND its argument: `set` with
+                // `execute_on_answer=system …` (or api_on_*, lua, eval) is as
+                // dangerous as naming the application itself — the builder mode
+                // already judges both fields of a line.
+                if ($this->containsDangerousApplication($node->getAttribute('application'))
+                    || $this->containsDangerousApplication($node->getAttribute('data'))) {
                     $errors[] = 'This XML contains a FreeSWITCH application that is not allowed.';
                     break 2;
                 }
