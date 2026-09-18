@@ -35,9 +35,6 @@ class StoreDialplanRequest extends FormRequest
     /** Line kinds v_dialplan_details accepts. */
     public const DETAIL_TAGS = ['condition', 'regex', 'action', 'anti-action'];
 
-    /** Lines that carry a FreeSWITCH application, hence the dangerous-application check. */
-    public const ACTION_TAGS = ['action', 'anti-action'];
-
     public const BREAK_VALUES = ['on-true', 'on-false', 'always', 'never'];
 
     public const EDITOR_MODES = ['builder', 'xml'];
@@ -106,14 +103,10 @@ class StoreDialplanRequest extends FormRequest
                 // The service ignores the lines in xml mode; judging them would
                 // refuse a payload on a field that is never written.
                 foreach ($this->detailLines() as $index => $detail) {
-                    $tag = $detail['dialplan_detail_tag'] ?? null;
-
-                    if (! in_array($tag, self::ACTION_TAGS, true)) {
-                        continue;
-                    }
-
-                    // Both the application and its argument are inspected: `set` with
-                    // `execute_on_answer=system …` is as dangerous as `system` itself.
+                    // EVERY line is judged, not only actions: FreeSWITCH expands
+                    // ${…} in condition attributes too, so a condition whose
+                    // field or expression carries ${system(…)} / ${lua(…)}
+                    // executes the same code as the action deny-list covers.
                     if ($service->containsDangerousApplication(self::asText($detail['dialplan_detail_type'] ?? null))
                         || $service->containsDangerousApplication(self::asText($detail['dialplan_detail_data'] ?? null))) {
                         $validator->errors()->add(

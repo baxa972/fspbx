@@ -321,6 +321,20 @@ class DialplanService
             }
         }
 
+        // FreeSWITCH expands ${…} in condition and regex attributes as well:
+        // <condition field="${system(id)}" …> executes the same code the action
+        // deny-list exists to block. Every attribute of these nodes is judged.
+        foreach (['condition', 'regex'] as $tagName) {
+            foreach ($document->getElementsByTagName($tagName) as $node) {
+                foreach ($node->attributes as $attribute) {
+                    if ($this->containsDangerousApplication($attribute->value)) {
+                        $errors[] = 'This XML contains a FreeSWITCH application that is not allowed.';
+                        break 3;
+                    }
+                }
+            }
+        }
+
         return array_values(array_unique($errors));
     }
 
@@ -524,7 +538,7 @@ class DialplanService
                 return true;
             }
 
-            if (preg_match("/\\{{$application}(?:[\\s}:]|$)/i", $xml)) {
+            if (preg_match("/\\{{$application}(?:[\\s}:(]|$)/i", $xml)) {
                 return true;
             }
         }

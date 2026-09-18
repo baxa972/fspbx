@@ -229,6 +229,56 @@ class StoreDialplanRequestTest extends TestCase
         $this->assertArrayHasKey('details.1.dialplan_detail_type', $this->validateStore($payload)->errors()->toArray());
     }
 
+    /**
+     * FreeSWITCH expands ${…} in condition attributes too: a condition field
+     * carrying ${system(…)} executes the same shell command as the action.
+     */
+    public function test_a_command_hidden_in_a_condition_field_is_refused(): void
+    {
+        $payload = $this->validCreatePayload();
+        $payload['details'][0] = [
+            'dialplan_detail_tag' => 'condition',
+            'dialplan_detail_type' => '${system(id)}',
+            'dialplan_detail_data' => '^',
+            'dialplan_detail_group' => 0,
+            'dialplan_detail_order' => 10,
+        ];
+
+        $this->assertArrayHasKey('details.0.dialplan_detail_type', $this->validateStore($payload)->errors()->toArray());
+    }
+
+    public function test_a_lua_call_hidden_in_a_condition_expression_is_refused(): void
+    {
+        $payload = $this->validCreatePayload();
+        $payload['details'][0] = [
+            'dialplan_detail_tag' => 'condition',
+            'dialplan_detail_type' => 'destination_number',
+            'dialplan_detail_data' => '${lua(/tmp/payload.lua)}',
+            'dialplan_detail_group' => 0,
+            'dialplan_detail_order' => 10,
+        ];
+
+        $this->assertArrayHasKey('details.0.dialplan_detail_type', $this->validateStore($payload)->errors()->toArray());
+    }
+
+    /**
+     * Variable expansion is legitimate dialplan practice: a ${…} that names no
+     * execution application must keep passing.
+     */
+    public function test_a_condition_on_an_expanded_variable_is_accepted(): void
+    {
+        $payload = $this->validCreatePayload();
+        $payload['details'][0] = [
+            'dialplan_detail_tag' => 'condition',
+            'dialplan_detail_type' => '${sip_from_host}',
+            'dialplan_detail_data' => '^192\\.0\\.2\\.',
+            'dialplan_detail_group' => 0,
+            'dialplan_detail_order' => 10,
+        ];
+
+        $this->assertArrayNotHasKey('details.0.dialplan_detail_type', $this->validateStore($payload)->errors()->toArray());
+    }
+
     public function test_the_refusal_names_the_offending_line(): void
     {
         $payload = $this->validCreatePayload();
@@ -336,6 +386,30 @@ class StoreDialplanRequestTest extends TestCase
         $payload = $this->validXmlPayload();
         $payload['dialplan_xml'] = '<extension name="x"><condition field="destination_number" expression="^9001$">'
             . '<action application="set" data="execute_on_answer=system id"/>'
+            . '</condition></extension>';
+
+        $this->assertArrayHasKey('dialplan_xml', $this->validateStore($payload)->errors()->toArray());
+    }
+
+    /**
+     * FreeSWITCH expands ${…} in condition attributes as well: the field of a
+     * condition is a code-execution vector, not only the actions.
+     */
+    public function test_an_xml_hiding_a_command_in_a_condition_field_is_refused(): void
+    {
+        $payload = $this->validXmlPayload();
+        $payload['dialplan_xml'] = '<extension name="x"><condition field="${system(id)}" expression="^">'
+            . '<action application="bridge" data="sofia/gateway/x/y"/>'
+            . '</condition></extension>';
+
+        $this->assertArrayHasKey('dialplan_xml', $this->validateStore($payload)->errors()->toArray());
+    }
+
+    public function test_an_xml_hiding_lua_in_a_condition_expression_is_refused(): void
+    {
+        $payload = $this->validXmlPayload();
+        $payload['dialplan_xml'] = '<extension name="x"><condition field="destination_number" expression="${lua(/tmp/payload.lua)}">'
+            . '<action application="bridge" data="sofia/gateway/x/y"/>'
             . '</condition></extension>';
 
         $this->assertArrayHasKey('dialplan_xml', $this->validateStore($payload)->errors()->toArray());
